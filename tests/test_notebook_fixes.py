@@ -275,3 +275,90 @@ class TestNB05ContextInjection:
         """Recall is checked in the model's reply, not by a substring window."""
         code = self._code()
         assert "[-200:]" not in code
+
+
+# ---------------------------------------------------------------------------
+# NB08: meta-teaching claims must match the infrastructure they describe
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = NOTEBOOKS_DIR.parent
+SKILL_PATH = PROJECT_ROOT / ".claude" / "skills" / "review-cca-compliance" / "SKILL.md"
+
+
+def _claude_argv(ci_yml: str) -> list[str]:
+    """Mirror the NB08 audit: drop comment lines, then tokenize the claude command."""
+    import re
+
+    code_only = "\n".join(line for line in ci_yml.splitlines() if not line.lstrip().startswith("#"))
+    match = re.search(r"claude \\\n(.*?)\n\s*\"", code_only, re.DOTALL)
+    assert match, "no claude command found"
+    return match.group(1).replace("\\", " ").split()
+
+
+class TestNB08MetaTeaching:
+    """NB08 describes the skill layout and CI flags; both must be real."""
+
+    def _nb(self):
+        return nbformat.read((NOTEBOOKS_DIR / "08_meta_teaching.ipynb").open(), as_version=4)
+
+    def test_skill_uses_discoverable_layout(self) -> None:
+        """Claude Code discovers .claude/skills/<name>/SKILL.md, not a flat .md file."""
+        assert SKILL_PATH.exists()
+        assert not (PROJECT_ROOT / ".claude" / "skills" / "review-cca-compliance.md").exists()
+        text = SKILL_PATH.read_text()
+        assert text.startswith("---\n")
+        assert "\nname: review-cca-compliance\n" in text
+        assert "\ndescription: " in text
+
+    def test_notebook_references_new_skill_path_only(self) -> None:
+        source = "\n".join(c.source for c in self._nb().cells)
+        assert ".claude/skills/review-cca-compliance/SKILL.md" in source
+        assert "review-cca-compliance.md" not in source
+        assert "Use the review-cca-compliance skill" not in source
+        assert "/review-cca-compliance src/" in source
+
+    def test_skill_check_count_matches_notebook_claim(self) -> None:
+        """The notebook says 11 checks; count numbered headings, not every '###'."""
+        import re
+
+        checks = re.findall(r"^### \d+\. ", SKILL_PATH.read_text(), re.MULTILINE)
+        assert len(checks) == 11
+        source = "\n".join(c.source for c in self._nb().cells if c.cell_type == "markdown")
+        assert "11 focused checks" in source
+
+    def test_ci_command_has_audited_flags(self) -> None:
+        """The flags must be on the claude command, not only in comments."""
+        argv = _claude_argv((PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+        assert "-p" in argv
+        assert "--bare" in argv
+        assert argv[argv.index("--output-format") + 1] == "json"
+        assert argv[argv.index("--allowedTools") + 1] == "Read,Grep,Glob"
+        assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+
+    def test_audit_ignores_flags_that_appear_only_in_comments(self) -> None:
+        """A substring check would pass on comments alone; the parsed audit must not."""
+        commented = "\n".join(
+            "# " + line if not line.lstrip().startswith("#") else line
+            for line in (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text().splitlines()
+        )
+        assert "--bare" in commented  # substring check would still say PASS
+        with pytest.raises(AssertionError, match="no claude command"):
+            _claude_argv(commented)
+
+    def test_notebook_audit_does_not_use_substring_matching(self) -> None:
+        code = "\n".join(c.source for c in self._nb().cells if c.cell_type == "code")
+        assert "present = flag in ci_content" not in code
+        assert 'startswith("#")' in code
+
+    def test_hierarchy_claims_match_docs_and_repo(self) -> None:
+        source = "\n".join(c.source for c in self._nb().cells if c.cell_type == "markdown")
+        assert "`./CLAUDE.md` or `./.claude/CLAUDE.md`" in source
+        assert "you add it to `.gitignore`" in source
+        assert "CLAUDE.local.md" in (PROJECT_ROOT / ".gitignore").read_text()
+        assert "No (gitignored)" not in source
+
+    def test_summary_table_maps_coordinator_to_nb03(self) -> None:
+        source = "\n".join(c.source for c in self._nb().cells if c.cell_type == "markdown")
+        assert "| Coordinator-Subagent | NB03 |" in source
+        assert "| Handoffs | NB06 |" in source
+        assert "| Coordinator-Subagent | NB06 |" not in source

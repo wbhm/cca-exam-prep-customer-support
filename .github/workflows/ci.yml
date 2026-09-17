@@ -92,22 +92,32 @@ jobs:
       - name: Run CCA compliance review
         id: review
         run: |
-          # -p flag: MANDATORY for non-interactive CI
-          # (CCA exam: without -p, pipeline hangs waiting for input)
+          # -p flag: required for any unattended run
+          # (CCA exam: without -p, the run waits for interactive input that never comes)
           #
           # --bare flag: RECOMMENDED for reproducibility
-          # (no CLAUDE.md loaded, deterministic behavior regardless of project config)
+          # (skips hooks, skills, commands, subagents, plugins, MCP servers, auto memory,
+          # and CLAUDE.md, so the run is the same on every machine; it also skips OAuth
+          # login, which is why ANTHROPIC_API_KEY is set from a secret above.
+          # Because skills are skipped, the review checklist is inlined in the prompt
+          # below instead of invoking .claude/skills/review-cca-compliance/SKILL.md)
           #
           # --output-format json: structured output at CLI level
           # (CCA exam: enables programmatic parsing; raw text output is non-deterministic)
           #
-          # --allowedTools Read,Grep,Glob: sandboxing
-          # (CCA exam: principle of least privilege for CI agents; no Write, no Bash)
+          # --allowedTools Read,Grep,Glob: pre-approve only the tools a review needs
+          # (CCA exam: principle of least privilege. This flag pre-approves; it does not
+          # remove other tools.)
+          #
+          # --permission-mode dontAsk: deny anything not pre-approved
+          # (anything that would prompt, such as Write or Bash, is denied instead of
+          # waiting on a prompt nobody can answer)
           REVIEW_JSON=$(claude \
             -p \
             --bare \
             --output-format json \
             --allowedTools Read,Grep,Glob \
+            --permission-mode dontAsk \
             "Review this pull request diff for CCA (Claude Certification for Agentic systems) compliance.
 
           Check for these CCA anti-patterns:
@@ -150,5 +160,5 @@ jobs:
           ${{ steps.review.outputs.review_text }}
 
           ---
-          *Reviewed by Claude using \`claude -p --bare --output-format json --allowedTools Read,Grep,Glob\`*
-          *CCA exam flags: \`-p\` (non-interactive), \`--bare\` (reproducible), \`--allowedTools\` (sandboxed)*"
+          *Reviewed by Claude using \`claude -p --bare --output-format json --allowedTools Read,Grep,Glob --permission-mode dontAsk\`*
+          *CCA exam flags: \`-p\` (non-interactive), \`--bare\` (reproducible), \`--allowedTools\` + \`--permission-mode dontAsk\` (least privilege)*"

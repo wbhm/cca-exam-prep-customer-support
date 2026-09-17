@@ -10,6 +10,9 @@ venv/
 # Environment
 .env
 
+# Claude Code personal overrides (not auto-ignored; the docs say to add this yourself)
+CLAUDE.local.md
+
 # IDE
 .idea/
 .vscode/

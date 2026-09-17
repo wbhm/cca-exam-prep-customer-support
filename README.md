@@ -122,7 +122,7 @@ This project doesn't just *teach* CCA patterns -- it *uses* them:
 
 ### Custom Skill
 
-- `.claude/skills/review-cca-compliance.md` -- Invoke to review any code for CCA compliance
+- `.claude/skills/review-cca-compliance/SKILL.md` -- run `/review-cca-compliance <path>` to review any code for CCA compliance
 - Demonstrates custom skills as reusable, on-demand workflows
 
 ### Programmatic Enforcement

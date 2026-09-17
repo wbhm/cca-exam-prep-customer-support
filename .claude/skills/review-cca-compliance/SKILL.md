@@ -1,20 +1,29 @@
+---
+name: review-cca-compliance
+description: Review Python code, notebooks, or CI workflows for CCA (Claude Certification for Agentic systems) architectural patterns. Use when asked to audit code for CCA compliance or CCA anti-patterns.
+---
+
 # Skill: review-cca-compliance
 
 Review any Python code, notebook, or workflow file for compliance with CCA (Claude Certification for Agentic systems) architectural patterns.
 
 ## Usage
 
-Invoke this skill when you need to audit code for CCA exam anti-patterns:
+Skills are discovered from `.claude/skills/<name>/SKILL.md`. Invoke this one directly as a slash command, with the file or directory to review as the argument:
 
 ```
-Use the review-cca-compliance skill to check this file: src/customer_service/agent/agent_loop.py
+/review-cca-compliance src/customer_service/agent/agent_loop.py
 ```
 
 Or to review a directory:
 
 ```
-Use the review-cca-compliance skill to audit the entire src/customer_service/agent/ directory.
+/review-cca-compliance src/customer_service/agent/
 ```
+
+Claude can also load this skill on its own when a request matches the `description` above, for example "audit this file for CCA anti-patterns".
+
+Note: `claude -p --bare` skips skill discovery, so a CI run with `--bare` does not load this file. The CI workflow in `.github/workflows/ci.yml` inlines the same checklist in its prompt for that reason.
 
 ---
 
@@ -106,12 +115,13 @@ Work through each section. For every check, report one of:
 
 ---
 
-### 7. Handoff Pattern (CCA Rule: structured EscalationRecord JSON via tool_choice)
+### 7. Handoff Pattern (CCA Rule: schema-enforced EscalationRecord JSON, tool_choice as backstop)
 
 - [ ] Is the escalation output a structured JSON object with all required fields? → **PASS**
   - Required: `customer_id`, `customer_tier`, `issue_type`, `disputed_amount`, `escalation_reason`, `recommended_action`, `conversation_summary`, `turns_elapsed`
 - [ ] Is the full conversation transcript passed to the human agent? → **FAIL**
-- [ ] Is `tool_choice={"type": "tool", "name": "escalate_to_human"}` used to force structured output? → **PASS**
+- [ ] Are the fields enforced by the `escalate_to_human` tool schema (Pydantic input model), so every escalation carries them? → **PASS**
+- [ ] Is `tool_choice={"type": "tool", "name": "escalate_to_human"}` used as the backstop when a business rule requires escalation but the model has not called the tool? → **PASS**
 
 **Anti-pattern signal:** Passing `messages` list directly to human agent, raw conversation dumps, `format_raw_handoff()`
 
@@ -160,13 +170,13 @@ Work through each section. For every check, report one of:
 
 ---
 
-### 11. CI/CD Flags (CCA Rule: -p mandatory, --bare recommended)
+### 11. CI/CD Flags (CCA Rule: -p for unattended runs, --bare for reproducibility)
 
-- [ ] Does any CI workflow use `claude` without `-p`? → **FAIL** (pipeline will hang)
-- [ ] Is `--bare` present for reproducibility? → **PASS** if yes, **WARN** if absent
+- [ ] Does any CI workflow use `claude` without `-p`? → **FAIL** (an unattended run waits for input that never comes)
+- [ ] Is `--bare` present? → **PASS** if yes, **WARN** if absent. `--bare` skips hooks, skills, commands, subagents, plugins, MCP servers, auto memory, and CLAUDE.md, so the run is the same on every machine. It also skips OAuth login, so `ANTHROPIC_API_KEY` must be set.
 - [ ] Is `--output-format json` used when output is parsed programmatically? → **PASS**
-- [ ] Is `jq -r '.result'` (or equivalent) used to extract text from JSON envelope? → **PASS**
-- [ ] Is `--allowedTools` scoped to minimum required tools (Read, Grep, Glob)? → **PASS**
+- [ ] Is `jq -r '.result'` (or equivalent) used to extract text from the JSON envelope? → **PASS**
+- [ ] Is `--allowedTools` limited to the tools the job needs (Read, Grep, Glob for a review)? → **PASS**. Note that `--allowedTools` pre-approves tools; it does not remove the others. Pair it with `--permission-mode dontAsk` so anything else is denied instead of waiting on a prompt.
 - [ ] Is `ANTHROPIC_API_KEY` stored as a secret, never hardcoded? → check workflow env blocks
 
 ---
