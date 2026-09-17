@@ -39,6 +39,8 @@
 - RIGHT: Deterministic business rules in code (PostToolUse callbacks)
 - Thresholds: amount > $500, account closure, VIP tier, legal complaint
 - Implemented as programmatic hooks, NEVER in prompts alone
+- A PostToolUse hook cannot fire when no tool was called, so the agent loop also checks the
+  flags at turn end and forces escalation if nothing reached the queue
 
 ### Tool Count
 - 4-5 focused tools per agent (architectural best practice)
@@ -62,7 +64,8 @@
 - RIGHT: Pass structured JSON with key fields at top:
   - customer_id, customer_tier, issue_type, disputed_amount
   - escalation_reason, recommended_action, conversation_summary, turns_elapsed
-- Use tool_choice enforcement for structured escalation output
+- The escalate_to_human tool schema enforces the fields (Layer 2); tool_choice is the backstop
+  that forces the call when a rule requires escalation and the turn ended without one
 
 ### Context Management
 - Structured JSON summaries, NOT raw transcripts
@@ -76,7 +79,8 @@
 ### Agentic Loop
 - Cycle: receive input → reason → call tools → evaluate results → decide next step
 - Terminate on stop_reason, NEVER content-type checking
-- stop_reason == "end_turn" → agent is done
+- stop_reason == "end_turn" → agent is done (this project's loop stops on any stop_reason
+  other than "tool_use", which also covers "max_tokens", and adds its own "escalated")
 - stop_reason == "tool_use" → dispatch tools, continue loop
 - Validation-retry loops for unreliable outputs
 
@@ -136,18 +140,25 @@
 
 | Level | Path | VCS | Authority |
 |-------|------|-----|-----------|
-| Managed/Org | System directory | No | Non-overridable |
-| Project | `.claude/CLAUDE.md` | Yes | Team standards |
+| Managed/Org | System directory | No | Non-overridable (cannot be excluded) |
+| Project | `./CLAUDE.md` or `./.claude/CLAUDE.md` | Yes | Team standards |
 | User | `~/.claude/CLAUDE.md` | No | Personal prefs |
-| Local | `CLAUDE.local.md` | No (gitignored) | Personal override |
+| Local | `./CLAUDE.local.md` | No (add it to `.gitignore` yourself) | Personal override |
+
+This project uses `.claude/CLAUDE.md` and lists `CLAUDE.local.md` in `.gitignore`.
 
 ---
 
 ## CI/CD Rules
-- `-p` flag MANDATORY for non-interactive mode
-- `--bare` flag RECOMMENDED for reproducibility
-- `--output-format json` for structured output at CLI level
-- `--allowedTools` for sandboxing
+- `-p` flag makes the run non-interactive; required for any unattended run (without it, the
+  run waits for input that never comes — the exam's "pipeline is hanging" signal)
+- `--bare` flag RECOMMENDED for reproducibility: skips hooks, skills, commands, subagents,
+  plugins, MCP servers, auto memory, and CLAUDE.md, and skips OAuth login (set
+  `ANTHROPIC_API_KEY`); the docs say it will become the default for `-p`
+- `--output-format json` for structured output at CLI level (text in the `result` field)
+- `--allowedTools` pre-approves the listed tools so they run without a prompt; it does not
+  remove the others. Pair with `--permission-mode dontAsk` to deny everything else (least
+  privilege for CI agents)
 
 ---
 
