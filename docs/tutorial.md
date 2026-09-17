@@ -50,8 +50,11 @@ The data flows like this:
 Customer message
   -> agent_loop.py calls client.messages.create()
   -> Claude returns tool_use blocks
-  -> callbacks.py validates each tool call against business rules
-  -> if approved: handlers.py dispatches to the correct tool handler -> service call
+  -> handlers.py dispatches each one to its handler -> service call
+  -> callbacks.py runs as a PostToolUse hook on the result (business rules in code)
+     - process_refund: propose -> escalation_callback -> commit, or block with no write
+     - log_interaction: compliance_callback redacts the input BEFORE the handler writes
+     - lookup_customer / check_policy: callbacks set escalation flags in the loop context
   -> if blocked: structured 'blocked' result with action_required=escalate_to_human
      -> agent_loop.py forces escalate_to_human with tool_choice
   -> loop continues until stop_reason != 'tool_use'
@@ -66,7 +69,7 @@ Every layer enforces a CCA principle:
 | Services | Deterministic business logic — no LLM reasoning in policy checks |
 | Tools | Exactly 5 focused tools with negative-bound descriptions |
 | Callbacks | Programmatic enforcement — business rules in code, not prompts |
-| Agent Loop | Stop-reason-controlled loop with forced escalation on blocked refunds |
+| Agent Loop | Stop-reason-controlled loop with forced escalation on blocked refunds and at turn end |
 | Coordinator | Context isolation — subagents see only explicit context strings |
 
 ---
@@ -124,7 +127,7 @@ class PolicyResult(BaseModel):
     requires_review: bool
 ```
 
-Three booleans from the PolicyEngine: is this within the tier limit? What is the limit? Does it exceed the $500 review threshold? The `requires_review` flag is independent of `approved` — a VIP requesting a $4,000 refund is approved (under the $5,000 limit) but still requires review (above $500).
+Three answers from the PolicyEngine: is this within the tier limit? What is the limit (a float)? Does it exceed the $500 review threshold? The `requires_review` flag is independent of `approved` — a VIP requesting a $4,000 refund is approved (under the $5,000 limit) but still requires review (above $500).
 
 ### EscalationRecord
 
@@ -157,7 +160,7 @@ class InteractionLog(BaseModel):
     timestamp: str
 ```
 
-Every tool call gets logged. The `details` field is a JSON string — not a raw dict — because the compliance callback needs to regex-scan it for PII *before* it hits the audit log. If details contained a nested Pydantic model, the redaction would need to understand model structure. A JSON string keeps redaction simple and reliable.
+One entry per `log_interaction` call; the policy prompt tells Claude to log every session, but nothing logs the other tool calls automatically. The `details` field is a string — not a dict — because the compliance callback needs to regex-scan it for PII *before* it hits the audit log. If details contained a nested Pydantic model, the redaction would need to understand model structure. A JSON string keeps redaction simple and reliable.
 
 ---
 
@@ -776,7 +779,7 @@ def compliance_callback(
     )
 ```
 
-The regex `\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b` matches credit card numbers in any common format (with spaces, dashes, or neither). The replacement preserves only the last 4 digits.
+`CARD_PATTERN` matches a 16-digit card number written in four groups with a dash or space between them. It requires the separators, so `4111-1111-1111-1234` and `4111 1111 1111 1234` are redacted while an unseparated `4111111111111234` passes through. Notebook 02 shows that limit; widening the regex is the fix. The replacement preserves only the last 4 digits.
 
 This callback runs *before* the `log_interaction` handler writes to the audit log. The dispatch function replaces `input_dict["details"]` with the redacted version, then calls the handler. The audit log never sees the raw card number.
 
@@ -785,8 +788,6 @@ The key insight: **the system prompt still tells Claude to redact PII** (good fo
 ### Why Pre-Handler, Not Post-Handler?
 
 Most callbacks run *after* the handler. The compliance callback is special — it runs *before*. Here is why:
-
-The pattern requires separators between the four groups, so `4111-1111-1111-1234` and `4111 1111 1111 1234` are redacted while an unseparated `4111111111111234` passes through. Notebook 02 shows that limit; widening the regex is the fix.
 
 If the callback ran after `log_interaction`, the handler would have already written the raw card number to the `AuditLog`. Even if the callback then returned a redacted result to Claude, the damage is done — the audit log contains PII. By running the callback first, the handler receives already-redacted input. The audit log is clean from the start.
 
@@ -821,7 +822,7 @@ SWISS_ARMY_TOOLS: list[dict] = TOOLS + _DISTRACTOR_TOOLS  # 15 tools
 15 tools. The canonical misroutes are:
 - `file_billing_dispute` overlaps with `process_refund` — Claude may call the wrong one
 - `create_support_ticket` overlaps with `escalate_to_human` — ticket creation instead of structured handoff
-- `transfer_to_department` overlaps with `escalate_to_human` — unstructured transfer
+- `update_billing_info` sits next to `process_refund` — a billing change is not a refund, but both touch money
 
 Research shows tool selection accuracy degrades beyond 4-5 tools. With 15 tools, Claude spends more tokens reasoning about which tool to use, makes more mistakes, and the system becomes harder to test and audit.
 
@@ -852,7 +853,7 @@ class RawTranscriptContext:
         return len(self.transcript) // 4
 ```
 
-Every turn appends to a growing list. Token usage grows O(n) with turn count. After 5-6 turns, the context becomes so large that Claude experiences the "lost in the middle" effect — information buried in the middle of a long context is less likely to be used.
+Every turn appends to one growing string. Token usage grows O(n) with turn count. After 5-6 turns, the context becomes so large that Claude experiences the "lost in the middle" effect — information buried in the middle of a long context is less likely to be used.
 
 No compaction. No budget. No structure. The entire conversation history is dumped into the system prompt on every API call.
 
@@ -914,7 +915,7 @@ def to_system_context(self) -> str:
 
 Note `tools_called[-5:]` — the display shows only the last 5 tools, but the internal list keeps the full history. The token estimate uses `len(text) // 4` as a rough character-to-token heuristic.
 
-The result: context stays within budget regardless of conversation length. Important information (customer ID, pending actions, recent decisions) is always at the top. Compaction fires around turn 7-8, well before the context becomes unwieldy.
+The result: context stays within budget regardless of conversation length. Important information (customer ID, pending actions, recent decisions) is always at the top. With short entries (the notebooks keep tool summaries under 80 characters) the rendered view plateaus around 100 estimated tokens and compaction never needs to fire. It fires only when individual entries are long, which is what the Notebook 05 stress cell demonstrates with entries of about 400 characters.
 
 ---
 
@@ -1021,11 +1022,11 @@ def format_raw_handoff(messages: list) -> str:
     return json.dumps(messages, indent=2, default=str)
 ```
 
-This serializes the entire `messages` list — including tool_use blocks, tool_result blocks, and all the JSON artifacts from every tool call. A typical conversation produces 2,000+ tokens of raw JSON. A human agent receiving this has to dig through tool artifacts to find the 8 pieces of information they actually need.
+This serializes the entire `messages` list — including tool_use blocks, tool_result blocks, and all the JSON artifacts from every tool call. A four-call conversation produces about 5,600 characters (roughly 1,400 tokens) of raw JSON. A human agent receiving this has to dig through tool artifacts to find the 8 pieces of information they actually need.
 
 ### The Correct Pattern: Structured EscalationRecord
 
-When escalation is triggered, Claude calls `escalate_to_human` with structured fields:
+When escalation is triggered, Claude calls `escalate_to_human`. The tool's input schema (a Pydantic model in `definitions.py`) requires all 8 fields, so every escalation carries them whether Claude called the tool on its own or the loop forced it:
 
 ```python
 record = EscalationRecord(
