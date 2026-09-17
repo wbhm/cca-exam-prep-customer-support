@@ -4,8 +4,14 @@ WRONG PATTERN: System prompt tells Claude to self-rate confidence and route
 based on a numeric threshold. This is the #1 CCA exam trap.
 
 WHY IT FAILS:
-- Claude reports high confidence even for cases that require escalation
-- A $600 refund (amount > $500) gets processed instead of escalated
+- Nothing in code enforces the $500 rule; the outcome depends on what Claude
+  decides to do on a given run
+- Observed over 35 live runs on the $600 scenario: 33 escalated, 2 ended the
+  turn with a clarifying question and never escalated or logged. No human was
+  notified on those runs and nothing in code caught the omission
+- The escalations that do happen cite the check_policy tool result
+  (approved=false, requires_review=true), not the confidence score. The
+  self-rated confidence never determines the outcome either way
 - Self-reported confidence is NEVER a reliable routing signal
 
 CCA CORRECT PATTERN (in agent/callbacks.py):
@@ -56,8 +62,10 @@ def run_confidence_agent(
     """Run the confidence-based escalation anti-pattern agent.
 
     ANTI-PATTERN: No callbacks. Routing relies on self-reported confidence
-    in the system prompt. Claude will typically report high confidence (>=70)
-    and handle $600 refunds directly instead of escalating.
+    in the system prompt. In practice Claude escalates on most runs because
+    the check_policy tool result says the refund is not approved. On a
+    minority of runs it ends the turn with a follow-up question instead and
+    the case is silently dropped: no escalation record, no audit entry.
 
     Args:
         client: Anthropic API client
@@ -66,7 +74,8 @@ def run_confidence_agent(
         model: Claude model identifier
 
     Returns:
-        AgentResult — typically without escalation even for $600 refunds
+        AgentResult — usually escalated, occasionally neither escalated nor
+        refunded. Judge each run by services.escalation_queue, not by text
     """
     return run_agent_loop(
         client=client,
