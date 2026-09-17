@@ -28,6 +28,21 @@ from customer_service.services.container import ServiceContainer
 LEGAL_KEYWORDS: list[str] = ["lawsuit", "attorney", "lawyer", "legal action", "sue", "court"]
 
 # ---------------------------------------------------------------------------
+# Escalation flags (CCA: deterministic rules, not LLM confidence)
+# Set in context by the enrichment callbacks; any active flag means a human
+# must see this case. Used by escalation_callback (blocks process_refund) and
+# by the agent loop (forces escalate_to_human if Claude ends its turn without
+# having escalated).
+# ---------------------------------------------------------------------------
+
+ESCALATION_FLAGS: dict[str, str] = {
+    "vip": "VIP account requires human review",
+    "account_closure": "Account closure in progress requires human review",
+    "legal_complaint": "Legal complaint detected — escalate immediately",
+    "requires_review": "Refund amount exceeds $500 review threshold",
+}
+
+# ---------------------------------------------------------------------------
 # PCI compliance: credit card regex
 # Matches 16-digit card numbers with dashes or spaces as separators.
 # Groups: (first-12-digits)(separator)(last-4-digits)
@@ -143,14 +158,7 @@ def escalation_callback(
     Returns action="block" with structured error JSON if any trigger is active.
     Returns action="allow" if no escalation conditions are met.
     """
-    escalation_flags = {
-        "vip": "VIP account requires human review",
-        "account_closure": "Account closure in progress requires human review",
-        "legal_complaint": "Legal complaint detected — escalate immediately",
-        "requires_review": "Refund amount exceeds $500 review threshold",
-    }
-
-    for flag, reason in escalation_flags.items():
+    for flag, reason in ESCALATION_FLAGS.items():
         if context.get(flag):
             blocked_result = {
                 "status": "blocked",

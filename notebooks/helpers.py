@@ -99,3 +99,92 @@ def compare_results(anti_result: dict, correct_result: dict) -> None:
 
     headers = ["Metric", "Anti-Pattern", "Correct", "Delta"]
     print(tabulate(rows, headers=headers, tablefmt="simple"))
+
+
+# ---------------------------------------------------------------------------
+# Scripted client for deterministic replays (no API calls)
+#
+# A live model mostly behaves well, so a guarantee cannot be demonstrated by
+# sampling it. These helpers replay a fixed transcript through run_agent_loop
+# so the exact turn where two designs diverge is visible on every run.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+def _usage() -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=0, output_tokens=0, cache_read_input_tokens=0, cache_creation_input_tokens=0
+    )
+
+
+def tool_turn(name: str, input_dict: dict, tool_id: str) -> SimpleNamespace:
+    """One scripted assistant turn in which Claude calls a single tool."""
+    block = SimpleNamespace(type="tool_use", name=name, input=input_dict, id=tool_id)
+    return SimpleNamespace(stop_reason="tool_use", content=[block], usage=_usage())
+
+
+def text_turn(text: str) -> SimpleNamespace:
+    """One scripted assistant turn in which Claude replies with text and stops."""
+    block = SimpleNamespace(type="text", text=text)
+    return SimpleNamespace(stop_reason="end_turn", content=[block], usage=_usage())
+
+
+def escalation_turn(customer_id: str, amount: float, reason: str) -> SimpleNamespace:
+    """A scripted escalate_to_human call, used as the reply to a forced tool_choice."""
+    return tool_turn(
+        "escalate_to_human",
+        {
+            "customer_id": customer_id,
+            "customer_tier": "regular",
+            "issue_type": "refund",
+            "disputed_amount": amount,
+            "escalation_reason": reason,
+            "recommended_action": "Human agent to review refund request",
+            "conversation_summary": f"Customer {customer_id} requested ${amount:.0f} refund",
+            "turns_elapsed": 3,
+        },
+        "toolu_forced",
+    )
+
+
+def scripted_client(transcript: list, on_forced: SimpleNamespace) -> SimpleNamespace:
+    """Build a fake Anthropic client that replays `transcript` turn by turn.
+
+    Any call that pins `tool_choice` (the agent loop's forced escalation) returns
+    `on_forced` instead of the next transcript turn. The same transcript can
+    therefore be replayed under the anti-pattern (which never forces a call) and
+    the correct pattern (which does when a rule requires it). Calls made after
+    the transcript is exhausted also return `on_forced`. Every call's kwargs are
+    recorded in `.calls` for inspection.
+    """
+    remaining = list(transcript)
+    calls: list[dict] = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if "tool_choice" in kwargs or not remaining:
+            return on_forced
+        return remaining.pop(0)
+
+    client = SimpleNamespace(messages=SimpleNamespace(create=create), calls=calls)
+    return client
+
+
+def tool_result_for(result: object, tool_name: str) -> dict | None:
+    """Return the parsed JSON tool_result that the loop sent back for `tool_name`.
+
+    Looks up the tool_use id from result.tool_calls, then finds the matching
+    tool_result block in result.messages. Returns None if the tool was never called.
+    """
+    ids = [tc["id"] for tc in result.tool_calls if tc["name"] == tool_name]  # type: ignore[attr-defined]
+    if not ids:
+        return None
+    for msg in result.messages:  # type: ignore[attr-defined]
+        if msg["role"] != "user" or not isinstance(msg["content"], list):
+            continue
+        for block in msg["content"]:
+            if isinstance(block, dict) and block.get("tool_use_id") == ids[0]:
+                return json.loads(block["content"])
+    return None

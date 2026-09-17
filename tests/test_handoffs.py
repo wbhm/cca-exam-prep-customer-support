@@ -687,3 +687,161 @@ class TestHandoffTokenComparison:
 
         ratio = len(raw) / len(structured)
         assert ratio > 5, f"Expected ratio > 5, got {ratio:.1f}x"
+
+
+# ---------------------------------------------------------------------------
+# TestTurnEndEscalation
+# ---------------------------------------------------------------------------
+
+
+class TestTurnEndEscalation:
+    """Turn-end enforcement: an escalation flag set by callbacks must reach the queue.
+
+    PostToolUse callbacks only run after a tool call. If Claude ends its turn
+    (for example by asking the customer a question) without ever calling
+    process_refund, the escalation_callback never fires. The loop must catch
+    that case and force escalate_to_human itself. Store is verified, not text.
+    """
+
+    _C003_MSG = "Customer ID: C003. I need a $600 refund for my damaged order."
+
+    def _c003_lookup_and_policy(self):
+        """Scripted first two turns: lookup C003, then check_policy for $600."""
+        lookup = _make_response(
+            stop_reason="tool_use",
+            content=[_make_tool_use_block("lookup_customer", {"customer_id": "C003"}, "toolu_01")],
+        )
+        policy = _make_response(
+            stop_reason="tool_use",
+            content=[
+                _make_tool_use_block(
+                    "check_policy",
+                    {"customer_id": "C003", "customer_tier": "regular", "requested_amount": 600.0},
+                    "toolu_02",
+                )
+            ],
+        )
+        return [lookup, policy]
+
+    def _question(self):
+        return _make_response(
+            stop_reason="end_turn",
+            content=[_make_text_block("Could you provide your order ID so I can proceed?")],
+        )
+
+    def _forced_escalation(self, tool_id="toolu_99"):
+        return _make_response(
+            stop_reason="end_turn",
+            content=[
+                _make_tool_use_block("escalate_to_human", _make_escalation_input(600.0), tool_id)
+            ],
+        )
+
+    def test_question_at_turn_end_with_review_flag_forces_escalation(self):
+        """$600 review flag set, Claude asks a question -> loop forces escalate_to_human."""
+        services = _make_services()
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            *self._c003_lookup_and_policy(),
+            self._question(),
+            self._forced_escalation(),
+        ]
+
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message=self._C003_MSG,
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+
+        # TEST THE STORE: the case must reach the escalation queue
+        escalations = services.escalation_queue.get_escalations()
+        assert len(escalations) == 1, "Turn-end with requires_review set must queue an escalation"
+        assert escalations[0].disputed_amount == 600.0
+        assert result.stop_reason == "escalated"
+        # The customer-facing question is preserved, not discarded
+        assert "order ID" in result.final_text
+        # Fourth call is the forced one
+        assert mock_client.messages.create.call_count == 4
+        forced_kwargs = mock_client.messages.create.call_args_list[3][1]
+        assert forced_kwargs["tool_choice"] == {"type": "tool", "name": "escalate_to_human"}
+
+    def test_turn_end_without_flags_does_not_force(self):
+        """C001 $50, no flags -> normal end_turn, no forced call, queue empty."""
+        services = _make_services()
+        lookup = _make_response(
+            stop_reason="tool_use",
+            content=[_make_tool_use_block("lookup_customer", {"customer_id": "C001"}, "toolu_01")],
+        )
+        policy = _make_response(
+            stop_reason="tool_use",
+            content=[
+                _make_tool_use_block(
+                    "check_policy",
+                    {"customer_id": "C001", "customer_tier": "regular", "requested_amount": 50.0},
+                    "toolu_02",
+                )
+            ],
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [lookup, policy, self._question()]
+
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="Customer ID: C001. Refund $50 please.",
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+
+        assert result.stop_reason == "end_turn"
+        assert services.escalation_queue.get_escalations() == []
+        assert mock_client.messages.create.call_count == 3
+
+    def test_voluntary_escalation_is_not_doubled(self):
+        """Claude escalates on its own, then ends turn -> exactly one record, no forced call."""
+        services = _make_services()
+        voluntary = _make_response(
+            stop_reason="tool_use",
+            content=[
+                _make_tool_use_block("escalate_to_human", _make_escalation_input(600.0), "toolu_03")
+            ],
+        )
+        done = _make_response(
+            stop_reason="end_turn", content=[_make_text_block("A specialist will follow up.")]
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [*self._c003_lookup_and_policy(), voluntary, done]
+
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message=self._C003_MSG,
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+
+        assert result.stop_reason == "end_turn"
+        assert len(services.escalation_queue.get_escalations()) == 1
+        assert mock_client.messages.create.call_count == 4
+
+    def test_no_callbacks_never_forces(self):
+        """Anti-pattern path (callbacks=None): same transcript, case is silently dropped."""
+        services = _make_services()
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            *self._c003_lookup_and_policy(),
+            self._question(),
+        ]
+
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message=self._C003_MSG,
+            system_prompt="anti-pattern prompt",
+        )
+
+        assert result.stop_reason == "end_turn"
+        assert services.escalation_queue.get_escalations() == []
+        assert mock_client.messages.create.call_count == 3

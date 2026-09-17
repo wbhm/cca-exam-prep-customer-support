@@ -563,7 +563,9 @@ If confidence >= 70, handle the request directly.
 """
 ```
 
-The problem: Claude *always* reports high confidence. When you ask it to process a $600 refund for a Regular customer, it confidently processes the refund — even though the amount exceeds the $500 review threshold and should trigger escalation. Claude does not know your business rules unless you enforce them in code.
+The problem is not that Claude reports high confidence and pays out. Measured over 35 live runs of the $600 refund for Regular customer C003, it never processed the refund. It escalated 33 times, and on 2 runs it ended its turn with a clarifying question (asking for an order ID) and never called `escalate_to_human` or `log_interaction`. The customer received a polite, professional reply. The escalation queue was empty. No human was notified.
+
+Two things drive that result. First, the prompt tells Claude to check policy, and `check_policy` returns `{"approved": false, "limit": 100.0, "requires_review": true}` for this case, so Claude usually escalates on the strength of the tool result rather than its confidence score. Second, in a single-turn agent loop, a clarifying question is a terminal state: nothing in code notices that a $600 case just ended without reaching a human. The confidence rating never determines the outcome either way. Claude does not know your business rules unless you enforce them in code, and even when a tool happens to tell it the rule, nothing guarantees it acts on it.
 
 The `run_confidence_agent()` function runs the agent with this prompt and the standard 5 tools (no callbacks):
 
@@ -578,7 +580,7 @@ def run_confidence_agent(client, user_message, services, tools=None):
     )
 ```
 
-Without callbacks, there is no programmatic check. Claude calls `process_refund` directly, and the FinancialSystem processes it. The $600 refund goes through, violating policy.
+Without callbacks, there is no programmatic check on the outcome. If Claude attempts `process_refund`, the handler runs. For C003 the handler's own tier check rejects the amount, so the money does not go out in this codebase, but nothing escalates and the case is dropped. If Claude instead stops to ask a question, the case is dropped the same way. A control that holds on 95% of runs is not a control, and this one fails quietly rather than loudly.
 
 ### The Correct Pattern: Deterministic Callback Rules
 
@@ -663,7 +665,13 @@ The flow is:
 4. Claude receives a `"blocked"` result with `action_required: "escalate_to_human"`
 5. The agent loop detects this and forces a `tool_choice` of `escalate_to_human`
 
-No LLM reasoning is involved in the escalation decision. The rules are deterministic and testable.
+There is a second enforcement point. A PostToolUse callback only runs after a tool call, so it cannot catch the run where Claude never calls `process_refund` and instead ends its turn with a question. When Claude stops, the loop checks the same flag table (`ESCALATION_FLAGS` in `callbacks.py`) against the escalation queue. If a flag is set and nothing has been queued, the loop appends an `escalation_required` notice and forces `escalate_to_human` the same way. Claude's customer-facing text is kept on the result.
+
+No LLM reasoning is involved in the escalation decision. The rules are deterministic and testable, and they are checked both after the refund attempt and at turn end.
+
+### What a live run actually shows
+
+On a typical live run the correct pattern looks the same as the anti-pattern: Claude reads the policy result and escalates voluntarily, and the callback is never exercised. That is expected. The guarantee is about the atypical run, and you cannot summon one from a live model on demand. Notebook 01 therefore replays two fixed transcripts through `run_agent_loop` with a scripted client, no API calls: one where Claude asks for an order ID and stops, and one where Claude attempts the refund. Under the anti-pattern both end with an empty escalation queue. Under the correct pattern both end with one queued record, every time.
 
 ### The Callback Registry
 
@@ -1019,7 +1027,7 @@ def _has_escalation_required(messages: list[dict]) -> bool:
     return False
 ```
 
-When `_has_escalation_required` returns True, the loop makes a second API call with `tool_choice={"type": "tool", "name": "escalate_to_human"}`, forcing Claude to call the escalation tool. This ensures that blocked refunds always result in structured handoffs, never abandoned conversations.
+When `_has_escalation_required` returns True, the loop makes a second API call with `tool_choice={"type": "tool", "name": "escalate_to_human"}`, forcing Claude to call the escalation tool. The loop applies the same forced call when Claude ends its turn with an escalation flag set in context and nothing yet in the escalation queue, which covers the run where Claude asks a question instead of attempting the refund. Together these ensure that a case requiring escalation always results in a structured handoff, never an abandoned conversation.
 
 ---
 
@@ -1367,7 +1375,7 @@ Claude is forced to call `escalate_to_human` with structured fields:
 
 ### Step 7: Loop Terminates
 
-After the forced escalation, Claude's response has `stop_reason="end_turn"`. The loop exits.
+After the forced escalation, the loop returns an `AgentResult` with `stop_reason="escalated"`. Had Claude instead ended its turn after step 4 without attempting the refund, the turn-end check would have found `requires_review` set and the queue empty, and forced the same escalation before returning.
 
 ### What We Can Verify
 

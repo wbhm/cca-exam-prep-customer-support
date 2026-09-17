@@ -28,7 +28,7 @@ The scenario tests critical architectural tradeoffs:
 
 2. **Tool Description Quality** -- Clear, detailed tool descriptions with negative bounds ("does NOT modify customer data") prevent the agent from misrouting. The 15-tool Swiss Army anti-pattern demonstrates how tool overload degrades selection accuracy.
 
-3. **Explicit Escalation Criteria** -- The agent escalates based on deterministic business rules, NOT self-reported confidence scores. The confidence escalation anti-pattern shows how Claude reports high confidence (>80%) and processes a $600 refund instead of escalating.
+3. **Explicit Escalation Criteria** -- The agent escalates based on deterministic business rules, NOT self-reported confidence scores. The confidence escalation anti-pattern has no rule in code: on most live runs Claude escalates the $600 refund anyway, because the policy tool result tells it the refund is not approved, but roughly one run in twenty it ends its turn with a clarifying question and the case is silently dropped with no human notified. The self-rated confidence never decides the outcome. Notebook 01 replays that dropped-case transcript through both patterns with a scripted client so the difference is visible on every run.
 
 4. **Structured Handoffs** -- The `escalate_to_human` tool provides a comprehensive EscalationRecord JSON (customer ID, tier, issue type, escalation reason, recommended action, conversation summary) enforced via `tool_choice`. The raw handoff anti-pattern dumps the entire conversation as unstructured text.
 
