@@ -243,3 +243,35 @@ class TestRawTranscriptAPI:
         output = ctx.to_context_string()
         assert "birthday" in output
         assert "CONVERSATION HISTORY" in output
+
+
+# ---------------------------------------------------------------------------
+# NB05: accumulated context must actually reach the model
+# ---------------------------------------------------------------------------
+
+
+class TestNB05ContextInjection:
+    """NB05 must send each strategy's accumulated context on every turn."""
+
+    def _code(self) -> str:
+        nb = nbformat.read((NOTEBOOKS_DIR / "05_context_management.ipynb").open(), as_version=4)
+        return "\n".join(c.source for c in nb.cells if c.cell_type == "code")
+
+    def test_raw_transcript_is_sent_in_system_prompt(self) -> None:
+        code = self._code()
+        assert "raw_transcript.to_context_string()" in code
+        assert 'get_system_prompt() + "\\n\\n" + context' in code
+
+    def test_summary_is_sent_in_system_prompt(self) -> None:
+        code = self._code()
+        assert "summary.to_system_context()" in code
+
+    def test_services_persist_across_turns(self) -> None:
+        """A session shares one service container; a fresh one per turn hides state."""
+        code = self._code()
+        assert "run_agent_loop(client, make_services()" not in code
+
+    def test_no_last_200_chars_check(self) -> None:
+        """Recall is checked in the model's reply, not by a substring window."""
+        code = self._code()
+        assert "[-200:]" not in code

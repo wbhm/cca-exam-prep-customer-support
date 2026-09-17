@@ -22,8 +22,9 @@ CCA Pitfall 5 (documented, not fixed):
 from dataclasses import dataclass, field
 
 # TOKEN_BUDGET: maximum token_estimate allowed before compaction fires.
-# Using len(text) // 4 character heuristic — approximately 75 tokens.
-# Fits comfortably in a system block without eating into the prompt cache savings.
+# It is compared against token_estimate, which is len(text) // 4, so the budget
+# is ~300 tokens (~1,200 characters) of rendered context. Small enough to sit in
+# a system block without eating into the prompt cache savings.
 TOKEN_BUDGET = 300
 
 
