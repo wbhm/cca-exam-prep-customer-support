@@ -17,6 +17,29 @@ _PRICE_CACHE_READ = 0.30  # $ per 1M cache-read tokens (10% of input)
 _PRICE_CACHE_WRITE = 3.75  # $ per 1M cache-write tokens (125% of input)
 
 
+def estimate_cost(usage: object) -> float:
+    """Return the estimated USD cost of one usage record at Sonnet 4.6 list prices.
+
+    Args:
+        usage: Any object with input_tokens / output_tokens and, optionally,
+            cache_read_input_tokens / cache_creation_input_tokens (an API
+            response's .usage or an agent loop's UsageSummary).
+
+    Cached tokens are billed at their own rates and are NOT also counted as
+    input_tokens, so the four terms are simply summed.
+    """
+    inp = usage.input_tokens  # type: ignore[attr-defined]
+    out = usage.output_tokens  # type: ignore[attr-defined]
+    cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    return (
+        inp * _PRICE_INPUT / 1_000_000
+        + out * _PRICE_OUTPUT / 1_000_000
+        + cr * _PRICE_CACHE_READ / 1_000_000
+        + cw * _PRICE_CACHE_WRITE / 1_000_000
+    )
+
+
 def print_usage(response: object, model: str = "claude-sonnet-4-6") -> None:
     """Print a formatted token-usage summary with estimated USD cost.
 
@@ -34,14 +57,7 @@ def print_usage(response: object, model: str = "claude-sonnet-4-6") -> None:
     cr = getattr(u, "cache_read_input_tokens", 0) or 0
     cw = getattr(u, "cache_creation_input_tokens", 0) or 0
     total = inp + out + cr + cw
-
-    # Estimated cost
-    cost = (
-        inp * _PRICE_INPUT / 1_000_000
-        + out * _PRICE_OUTPUT / 1_000_000
-        + cr * _PRICE_CACHE_READ / 1_000_000
-        + cw * _PRICE_CACHE_WRITE / 1_000_000
-    )
+    cost = estimate_cost(u)
 
     print(f"\n{'Token Usage':\u2500<40}")
     print(f"  {'Input tokens:':<28} {inp:>8,}")

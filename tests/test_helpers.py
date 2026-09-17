@@ -1,4 +1,4 @@
-"""Unit tests for notebooks/helpers.py — print_usage and compare_results."""
+"""Unit tests for notebooks/helpers.py — estimate_cost, print_usage and compare_results."""
 
 import sys
 from pathlib import Path
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notebooks"))
-from helpers import compare_results, print_usage  # noqa: E402
+from helpers import compare_results, estimate_cost, print_usage  # noqa: E402
 
 
 def make_usage(
@@ -113,3 +113,34 @@ def test_compare_results_zero_baseline(capsys: pytest.CaptureFixture[str]) -> No
     compare_results(anti, correct)
     captured = capsys.readouterr()
     assert "N/A" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# estimate_cost tests
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_cost_uncached() -> None:
+    """1M input tokens at $3 and 1M output tokens at $15 cost $18."""
+    usage = make_usage(input_tokens=1_000_000, output_tokens=1_000_000).usage
+    assert estimate_cost(usage) == pytest.approx(18.0)
+
+
+def test_estimate_cost_cache_read_is_ten_percent_of_input() -> None:
+    """The same tokens served from cache cost 10% of the uncached price."""
+    uncached = make_usage(input_tokens=1_000_000, output_tokens=0).usage
+    cached = make_usage(input_tokens=0, output_tokens=0, cache_read=1_000_000).usage
+    assert estimate_cost(cached) == pytest.approx(0.1 * estimate_cost(uncached))
+
+
+def test_estimate_cost_cache_write_is_125_percent_of_input() -> None:
+    """Writing tokens to cache costs 125% of the uncached price."""
+    uncached = make_usage(input_tokens=1_000_000, output_tokens=0).usage
+    written = make_usage(input_tokens=0, output_tokens=0, cache_write=1_000_000).usage
+    assert estimate_cost(written) == pytest.approx(1.25 * estimate_cost(uncached))
+
+
+def test_estimate_cost_missing_cache_fields() -> None:
+    """A usage object without cache attributes is priced on input/output only."""
+    usage = make_usage(input_tokens=1000, output_tokens=1000).usage
+    assert estimate_cost(usage) == pytest.approx(0.018)
