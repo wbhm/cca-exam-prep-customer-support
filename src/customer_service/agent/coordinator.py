@@ -16,6 +16,13 @@ CCA Isolation Rule:
 
   Wrong (anti-pattern — DO NOT do this):
     run_agent_loop(..., user_message=coordinator_messages, ...)
+
+CCA Silent-Failure Rule:
+  The coordinator must distinguish "no data" from "failed to retrieve". A subagent
+  result that carries a structured error (max_tokens, escalation_failed,
+  max_iterations) is never pasted into the synthesis prompt as if it were a
+  finished answer. It is replaced by an explicit unavailable marker and listed in
+  CoordinatorResult.degraded so the caller can act on it.
 """
 
 import json
@@ -106,10 +113,14 @@ class CoordinatorResult:
     Attributes:
         subagent_results: List of AgentResult from each specialized subagent.
         synthesis: Unified customer-facing response combining all subagent outputs.
+        degraded: One entry per subagent whose result carried a structured error:
+            {"topic", "stop_reason", "error_type"}. Empty when every subagent finished.
+            The full error dict is on the matching AgentResult.error.
     """
 
     subagent_results: list[AgentResult] = field(default_factory=list)
     synthesis: str = ""
+    degraded: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +239,23 @@ def run_coordinator(
         )
         subagent_results.append(agent_result)
 
-    # Step 3 — Synthesize: combine all subagent outputs into unified response
-    subagent_summaries = "\n\n".join(
-        f"[{subtasks[i].get('topic', 'unknown')}]: {r.final_text}"
-        for i, r in enumerate(subagent_results)
-    )
+    # Step 3 — Synthesize: combine all subagent outputs into unified response.
+    # CCA Silent-Failure Rule: a result carrying a structured error is NOT an answer.
+    # Its partial text is withheld from synthesis; the caller sees it in `degraded`.
+    summary_lines: list[str] = []
+    degraded: list[dict] = []
+    for subtask, r in zip(subtasks, subagent_results, strict=True):
+        topic = subtask.get("topic", "unknown")
+        if r.error is None:
+            summary_lines.append(f"[{topic}]: {r.final_text}")
+            continue
+        error_type = r.error["error_type"]
+        degraded.append({"topic": topic, "stop_reason": r.stop_reason, "error_type": error_type})
+        summary_lines.append(
+            f"[{topic}]: specialist response unavailable ({error_type}). "
+            "Tell the customer this part of their request is being followed up separately."
+        )
+    subagent_summaries = "\n\n".join(summary_lines)
     synthesis_prompt = (
         f"Customer message: {user_message}\n\n"
         f"Specialist responses:\n{subagent_summaries}\n\n"
@@ -254,6 +277,7 @@ def run_coordinator(
     return CoordinatorResult(
         subagent_results=subagent_results,
         synthesis=synthesis_text,
+        degraded=degraded,
     )
 
 

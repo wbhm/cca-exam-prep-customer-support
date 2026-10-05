@@ -12,6 +12,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from customer_service.agent.agent_loop import AgentResult, UsageSummary
 from customer_service.agent.coordinator import CoordinatorResult, run_coordinator
 from customer_service.data.customers import CUSTOMERS
 from customer_service.services.audit_log import AuditLog
@@ -464,3 +465,99 @@ class TestSubagentFreshMessages:
         assert len(captured_system_prompts) == 2
         assert captured_system_prompts[0] == SUBAGENT_PROMPTS["refund"]
         assert captured_system_prompts[1] == SUBAGENT_PROMPTS["shipping"]
+
+
+# ---------------------------------------------------------------------------
+# TestCoordinatorDistinguishesFailedSubagents
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorDistinguishesFailedSubagents:
+    """CCA silent-failure rule: the coordinator must tell 'no data' from 'failed'.
+
+    A subagent that hit max_tokens or could not escalate carries a structured
+    error. Its partial text must never be pasted into the synthesis prompt as if
+    it were a finished answer, and the caller must be able to see which subtasks
+    degraded without re-reading every AgentResult.
+    """
+
+    @staticmethod
+    def _run(subagent_outcomes: dict[str, AgentResult]):
+        services = _make_services()
+        coordinator_response = _make_coordinator_decomposition_response(list(subagent_outcomes))
+        synthesis_response = _make_text_response("Unified reply")
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [coordinator_response, synthesis_response]
+
+        def fake_run_agent_loop(client, services, user_message, system_prompt, **kwargs):
+            topic = user_message.split("Task: ")[1].split("\n")[0]
+            return subagent_outcomes[topic]
+
+        with patch(
+            "customer_service.agent.coordinator.run_agent_loop",
+            side_effect=fake_run_agent_loop,
+        ):
+            result = run_coordinator(
+                client=mock_client,
+                services=services,
+                user_message="refund and shipping",
+                customer_id="C001",
+            )
+        synthesis_prompt = mock_client.messages.create.call_args_list[1].kwargs["messages"][0][
+            "content"
+        ]
+        return result, synthesis_prompt
+
+    def test_truncated_subagent_text_is_not_pasted_into_synthesis(self):
+        truncated = "Your package is at the depot and will be deliv"
+        result, prompt = self._run(
+            {
+                "refund": AgentResult(
+                    stop_reason="end_turn",
+                    final_text="Refund of $50 processed.",
+                    usage=UsageSummary(),
+                ),
+                "shipping": AgentResult(
+                    stop_reason="max_tokens",
+                    final_text=truncated,
+                    usage=UsageSummary(),
+                    error={
+                        "status": "error",
+                        "error_type": "truncated",
+                        "source": "agent_loop",
+                        "message": "Reply cut off by max_tokens",
+                        "retry_eligible": True,
+                        "fallback_available": True,
+                        "partial_data": {"final_text": truncated},
+                    },
+                ),
+            }
+        )
+
+        # The finished answer is passed through; the truncated one is not
+        assert "Refund of $50 processed." in prompt
+        assert truncated not in prompt
+        # The synthesis step is told the shipping answer is unavailable, and why
+        assert "[shipping]" in prompt
+        assert "unavailable" in prompt.lower()
+        assert "truncated" in prompt
+        # The caller can see which subtasks degraded without re-reading every result
+        assert result.degraded == [
+            {"topic": "shipping", "stop_reason": "max_tokens", "error_type": "truncated"}
+        ]
+
+    def test_all_complete_means_nothing_degraded(self):
+        result, prompt = self._run(
+            {
+                "refund": AgentResult(
+                    stop_reason="end_turn", final_text="Refund done.", usage=UsageSummary()
+                ),
+                "shipping": AgentResult(
+                    stop_reason="end_turn", final_text="Shipped today.", usage=UsageSummary()
+                ),
+            }
+        )
+        assert result.degraded == []
+        assert "Refund done." in prompt
+        assert "Shipped today." in prompt
+        assert "unavailable" not in prompt.lower()

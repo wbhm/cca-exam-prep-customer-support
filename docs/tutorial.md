@@ -1233,12 +1233,25 @@ def run_coordinator(
         )
         subagent_results.append(agent_result)
 
-    # Step 3: SYNTHESIZE — Combine subagent outputs into one reply
+    # Step 3: SYNTHESIZE — Combine subagent outputs into one reply.
+    # A result carrying a structured error (max_tokens, escalation_failed,
+    # max_iterations) is NOT an answer: its text is withheld from the prompt and
+    # the subtask is listed in `degraded` so the caller can act on it.
+    summary_lines, degraded = [], []
+    for subtask, r in zip(subtasks, subagent_results, strict=True):
+        if r.error is None:
+            summary_lines.append(f"[{subtask['topic']}]: {r.final_text}")
+        else:
+            degraded.append({"topic": subtask["topic"], "stop_reason": r.stop_reason,
+                             "error_type": r.error["error_type"]})
+            summary_lines.append(f"[{subtask['topic']}]: specialist response unavailable "
+                                 f"({r.error['error_type']}) ...")
     synthesis_prompt = f"Customer message: {user_message}\n\nSpecialist responses:\n..."
     synthesis_response = client.messages.create(model=model, max_tokens=512, ...)
     synthesis_text = ...  # first text block
 
-    return CoordinatorResult(subagent_results=subagent_results, synthesis=synthesis_text)
+    return CoordinatorResult(subagent_results=subagent_results, synthesis=synthesis_text,
+                             degraded=degraded)
 ```
 
 ### Context Isolation (CCA Rule)

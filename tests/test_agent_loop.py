@@ -366,3 +366,111 @@ class TestStopReasonDispatch:
         assert err.result.stop_reason == "some_future_value"
         assert len(err.result.messages) == 2
         assert err.result.usage.input_tokens == 7
+
+
+# ---------------------------------------------------------------------------
+# TestStructuredErrorOnDegradedResults
+# ---------------------------------------------------------------------------
+
+STRUCTURED_ERROR_FIELDS = {
+    "status",
+    "error_type",
+    "source",
+    "message",
+    "retry_eligible",
+    "fallback_available",
+    "partial_data",
+}
+
+
+class TestStructuredErrorOnDegradedResults:
+    """CCA silent-failure rule: a degraded outcome carries structured error context.
+
+    A bare stop_reason string tells the caller WHAT happened. The error dict tells
+    it what to DO: whether a retry can help, whether a fallback exists, and what
+    partial state is available. Same six-field shape the tool dispatcher uses.
+    """
+
+    def test_end_turn_result_has_no_error(self, services):
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="end_turn", content=[_make_text_block("All done")]
+        )
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "end_turn"
+        assert result.error is None
+
+    def test_max_tokens_result_carries_structured_error(self, services):
+        """Truncated reply -> error says retry is possible and carries the partial text."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="max_tokens", content=[_make_text_block("Truncat")]
+        )
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "max_tokens"
+        assert result.error is not None
+        assert set(result.error) == STRUCTURED_ERROR_FIELDS
+        assert result.error["status"] == "error"
+        assert result.error["error_type"] == "truncated"
+        assert result.error["source"] == "agent_loop"
+        assert result.error["retry_eligible"] is True
+        assert result.error["fallback_available"] is True
+        assert result.error["partial_data"] == {"final_text": "Truncat"}
+
+    def test_escalation_failed_result_carries_structured_error(self, services):
+        """Forced escalation queued nothing -> not retryable, names the trigger."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _make_response(stop_reason="refusal", content=[]),
+            _make_response(stop_reason="refusal", content=[]),
+        ]
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert services.escalation_queue.get_escalations() == []
+        assert result.stop_reason == "escalation_failed"
+        assert result.error is not None
+        assert set(result.error) == STRUCTURED_ERROR_FIELDS
+        assert result.error["error_type"] == "escalation_failed"
+        assert result.error["retry_eligible"] is False
+        assert result.error["fallback_available"] is False
+        assert result.error["partial_data"]["flag_triggered"] == "refusal"
+
+    def test_max_iterations_result_carries_structured_error(self, services):
+        """Safety limit hit -> retryable, reports how many tool calls were made."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="tool_use",
+            content=[_make_tool_use_block("lookup_customer", {"customer_id": "C001"})],
+        )
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="hi",
+            system_prompt="t",
+            max_iterations=3,
+        )
+        assert result.stop_reason == "max_iterations"
+        assert result.error is not None
+        assert set(result.error) == STRUCTURED_ERROR_FIELDS
+        assert result.error["error_type"] == "max_iterations"
+        assert result.error["retry_eligible"] is True
+        assert result.error["partial_data"] == {"tool_calls": 3}
+
+    def test_escalated_result_has_no_error(self, services):
+        """A verified handoff is a success, not a degraded outcome."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _make_response(stop_reason="refusal", content=[]),
+            _forced_escalation_response(),
+        ]
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "escalated"
+        assert len(services.escalation_queue.get_escalations()) == 1
+        assert result.error is None

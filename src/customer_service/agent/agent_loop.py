@@ -18,6 +18,9 @@ CCA Rules enforced here:
   would otherwise drop the case silently), and when Claude refuses to continue
 - 'escalated' is a claim about the escalation_queue, verified against the store.
   A forced call that produces nothing returns 'escalation_failed', never 'escalated'
+- Degraded outcomes (max_tokens, escalation_failed, max_iterations) carry the
+  same structured error context the tool dispatcher returns, so a caller such as
+  the coordinator can tell 'finished' from 'failed' without parsing strings
 - Accumulate usage tokens across all iterations
 - Safety limit: max_iterations guard returns 'max_iterations' stop_reason
 """
@@ -61,6 +64,14 @@ class AgentResult:
 
     'refusal', 'tool_use' and 'pause_turn' never appear here: refusal is converted
     into an escalation outcome, and the other two keep the loop running.
+
+    error is None for 'end_turn', 'stop_sequence' and 'escalated'. For the degraded
+    outcomes it is the CCA structured error context (status, error_type, source,
+    message, retry_eligible, fallback_available, partial_data):
+        'max_tokens'        -> error_type 'truncated', retry_eligible, partial final_text
+        'escalation_failed' -> error_type 'escalation_failed', NOT retryable, names the
+                               flag that required escalation
+        'max_iterations'    -> error_type 'max_iterations', retry_eligible, tool call count
     """
 
     stop_reason: str
@@ -68,6 +79,7 @@ class AgentResult:
     tool_calls: list[dict] = field(default_factory=list)
     final_text: str = ""
     usage: UsageSummary = field(default_factory=UsageSummary)
+    error: dict | None = None
 
 
 class UnexpectedStopReasonError(RuntimeError):
@@ -82,6 +94,29 @@ class UnexpectedStopReasonError(RuntimeError):
         super().__init__(f"Unhandled stop_reason {stop_reason!r} from the Messages API")
         self.stop_reason = stop_reason
         self.result = result
+
+
+def _structured_error(
+    error_type: str,
+    message: str,
+    retry_eligible: bool,
+    fallback_available: bool,
+    partial_data: dict,
+) -> dict:
+    """Build the CCA structured error context for a degraded loop outcome.
+
+    Same six-field shape as the tool dispatcher's error results (see handlers.py),
+    so one consumer can handle both boundaries the same way.
+    """
+    return {
+        "status": "error",
+        "error_type": error_type,
+        "source": "agent_loop",
+        "message": message,
+        "retry_eligible": retry_eligible,
+        "fallback_available": fallback_available,
+        "partial_data": partial_data,
+    }
 
 
 def _first_text(content: list) -> str:
@@ -196,13 +231,14 @@ def run_agent_loop(
     tool_calls: list[dict] = []
     usage = UsageSummary()
 
-    def _result(stop_reason: str, final_text: str) -> AgentResult:
+    def _result(stop_reason: str, final_text: str, error: dict | None = None) -> AgentResult:
         return AgentResult(
             stop_reason=stop_reason,
             messages=messages,
             tool_calls=tool_calls,
             final_text=final_text,
             usage=usage,
+            error=error,
         )
 
     def _record_assistant_turn(content: list) -> None:
@@ -269,7 +305,21 @@ def run_agent_loop(
         if notice is not None:
             messages.append({"role": "user", "content": json.dumps(notice)})
         queued = _force_escalation()
-        return _result("escalated" if queued else "escalation_failed", final_text)
+        if queued:
+            return _result("escalated", final_text)
+        flag = notice["flag_triggered"] if notice is not None else "blocked_refund"
+        return _result(
+            "escalation_failed",
+            final_text,
+            error=_structured_error(
+                error_type="escalation_failed",
+                message="Escalation was required but the forced escalate_to_human call "
+                "queued nothing; no human has seen this case",
+                retry_eligible=False,
+                fallback_available=False,
+                partial_data={"flag_triggered": flag, "final_text": final_text},
+            ),
+        )
 
     def _finish_turn(stop_reason: str, final_text: str) -> AgentResult:
         """Claude stopped generating. Apply turn-end escalation enforcement.
@@ -281,7 +331,16 @@ def run_agent_loop(
         """
         flag = _pending_escalation_flag(context, services)
         if flag is None:
-            return _result(stop_reason, final_text)
+            error = None
+            if stop_reason == "max_tokens":
+                error = _structured_error(
+                    error_type="truncated",
+                    message="Reply cut off by max_tokens; final_text is incomplete",
+                    retry_eligible=True,
+                    fallback_available=True,
+                    partial_data={"final_text": final_text},
+                )
+            return _result(stop_reason, final_text, error=error)
         notice = {
             "status": "escalation_required",
             "reason": ESCALATION_FLAGS[flag],
@@ -343,4 +402,14 @@ def run_agent_loop(
                 )
 
     # Safety limit exceeded
-    return _result("max_iterations", "")
+    return _result(
+        "max_iterations",
+        "",
+        error=_structured_error(
+            error_type="max_iterations",
+            message=f"Loop exceeded max_iterations={max_iterations} without finishing",
+            retry_eligible=True,
+            fallback_available=True,
+            partial_data={"tool_calls": len(tool_calls)},
+        ),
+    )
