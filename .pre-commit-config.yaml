@@ -12,3 +12,14 @@ repos:
     rev: 0.9.1
     hooks:
       - id: nbstripout
+
+  # Local hook: the test suite. Lint and format alone let a red suite through.
+  # Runs the project's own command so it matches CI and the Claude Code hook.
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: poetry run pytest -q -x
+        language: system
+        pass_filenames: false
+        always_run: true

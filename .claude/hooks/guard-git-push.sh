@@ -13,15 +13,22 @@
 #
 # CCA_GUARD_TEST_CMD overrides the test command so the hook's own tests can
 # substitute `true` / `false` instead of recursing into the full suite.
+#
+# Limitation: the hook sees only the command text. A commit issued from inside
+# another program (a Python subprocess, a Makefile) is invisible to it. The git
+# pre-commit hook in .pre-commit-config.yaml covers that path.
 set -u
 
 INPUT=$(cat)
 COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
 
-case "$COMMAND" in
-  *"git commit"* | *"git push"*) ;;
-  *) exit 0 ;;
-esac
+# Match a git invocation at the start of a line or after a command separator,
+# with any options between `git` and the verb. A mention of "git commit" inside
+# a heredoc body or a quoted string is not an invocation and must not match.
+GIT_VERB='(^|[;&|(]|\$\()[[:space:]]*(command[[:space:]]+)?git([[:space:]]+[^[:space:]]+)*[[:space:]]+(commit|push)([[:space:]]|$)'
+if ! printf '%s\n' "$COMMAND" | grep -Eq "$GIT_VERB"; then
+  exit 0
+fi
 
 cd "${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}" || exit 0
 

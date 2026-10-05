@@ -13,6 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS = ROOT / ".claude" / "settings.json"
+PRE_COMMIT_CONFIG = ROOT / ".pre-commit-config.yaml"
+README = ROOT / "README.md"
 HOOK = ROOT / ".claude" / "hooks" / "guard-git-push.sh"
 
 
@@ -57,3 +59,32 @@ class TestPreToolUseGuardBehavior:
     def test_ignores_commands_that_are_not_commit_or_push(self) -> None:
         # The suite must not run for other commands, so a failing test command is irrelevant.
         assert _run_hook("git status && ls", "false").returncode == 0
+
+    def test_ignores_heredoc_text_that_mentions_git_commit(self) -> None:
+        # The guard matches a git invocation, not the substring. Writing a README line
+        # through a heredoc must not trigger the suite, or a red suite blocks its own fix.
+        cmd = "cat > notes.md <<'EOF'\nRun the suite before every `git commit`.\nEOF"
+        assert _run_hook(cmd, "false").returncode == 0
+
+    def test_blocks_commit_with_git_options_before_the_verb(self) -> None:
+        assert _run_hook("cd src && git -c user.name=x commit -m 'x'", "false").returncode == 2
+
+
+class TestGitPreCommitGuard:
+    """The git-level layer: fires on any `git commit`, not only ones Claude Code issues."""
+
+    def test_pre_commit_config_runs_the_test_suite(self) -> None:
+        import yaml
+
+        config = yaml.safe_load(PRE_COMMIT_CONFIG.read_text())
+        local_hooks = [h for r in config["repos"] if r["repo"] == "local" for h in r["hooks"]]
+        pytest_hooks = [h for h in local_hooks if "pytest" in h["entry"]]
+        assert pytest_hooks, "no local pre-commit hook runs pytest (lint-only config)"
+        hook = pytest_hooks[0]
+        assert hook.get("always_run") is True, "must run even when no .py file is staged"
+        assert hook.get("pass_filenames") is False, "pytest must not receive staged filenames"
+
+    def test_readme_tells_contributors_to_install_the_hook(self) -> None:
+        text = README.read_text()
+        assert "pre-commit install" in text
+        assert "enforced on every commit" not in text, "a config is not enforcement until installed"

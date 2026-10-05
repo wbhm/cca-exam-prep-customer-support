@@ -47,6 +47,7 @@ task setup
 
 # Or manually:
 poetry install --with notebooks
+poetry run pre-commit install  # git hook: ruff, nbstripout, and the test suite on every commit
 cp .env.example .env  # Add your ANTHROPIC_API_KEY
 poetry run jupyter lab
 ```
@@ -130,7 +131,8 @@ This project doesn't just *teach* CCA patterns -- it *uses* them:
 
 ### Programmatic Enforcement
 
-- `.pre-commit-config.yaml` -- nbstripout + ruff enforced on every commit
+- `.pre-commit-config.yaml` -- nbstripout, ruff, and the test suite on every `git commit`, once you run `poetry run pre-commit install` (the config alone enforces nothing)
+- `.claude/settings.json` -- a PreToolUse hook that runs the suite and blocks `git commit` / `git push` from Claude Code when it is red
 - Same principle as callbacks: code enforces rules, not human memory
 
 ## Testing
