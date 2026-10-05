@@ -208,6 +208,23 @@ The structured error shape has six fields: `status`, `error_type`, `source`, `re
 
 ---
 
+### 13. Harness Guards (CCA Rule: programmatic enforcement applies to the dev loop too)
+
+The first CCA principle says code is law and prompts are guidance. That applies to the harness the agent runs in, not only to the agent's own callbacks. A CLAUDE.md line such as "run tests before committing" is prompt guidance; a hook that exits 2 is enforcement. Check each layer in turn.
+
+- [ ] **Claude Code hook.** Is there a `PreToolUse` hook on `Bash` in `.claude/settings.json` that runs the test suite and exits 2 when the command contains `git commit` or `git push` and the suite fails? → **PASS**. Is the only guard a sentence in CLAUDE.md or a system prompt? → **FAIL**
+- [ ] Is the hook in the committed `.claude/settings.json`, not only in `settings.local.json` or `~/.claude/settings.json`? → **PASS**. Local-only means every other clone and every CI run is unguarded → **WARN**
+- [ ] Does the hook script read `.tool_input.command` from stdin with `jq`, write its reason to stderr, and `exit 2`? → **PASS**. Does it print JSON with no exit code, or exit non-zero without 2? → **WARN** (a non-2 exit is a non-blocking error; the command still runs)
+- [ ] **Git hook.** Does `.pre-commit-config.yaml` (or `.git/hooks`) run the tests, and does the README tell contributors to run `pre-commit install`? → **PASS**. Lint-only config, or no install instruction? → **WARN** (a config that nobody installs guards nothing)
+- [ ] **CI.** Does the workflow run the tests on push to the default branch, and has it executed at least once (an `Actions` run exists)? → **PASS**. A workflow with zero runs → **WARN** (on a fork, GitHub disables workflows until the owner enables them in the Actions tab; `--bare` also skips hooks, so CI is the only guard for a `--bare` run)
+- [ ] Optional: is there a `PostToolUse` hook on `Edit|Write` that runs the linter or the affected tests? → **PASS** if present, no penalty if absent
+
+**Anti-pattern signal:** CLAUDE.md "always run tests before committing" with no hook; `poetry run pytest | tail -1 && git commit` (the pipe masks pytest's exit code); a `hooks` block only in `settings.local.json`; a CI workflow whose Actions tab shows no runs
+
+**Correct pattern signal:** `"PreToolUse": [{"matcher": "Bash", ...}]` in `.claude/settings.json`, `jq -r '.tool_input.command'`, `exit 2`, `pre-commit install` in the README, a green run on the default branch
+
+---
+
 ## Output Format
 
 For each check, report findings in this format:
@@ -234,6 +251,7 @@ End with a summary table:
 | Escalation Logic | PASS | deterministic callbacks |
 | Agentic Loop | FAIL | max_tokens and refusal collapsed into "done" |
 | Silent Failure Prevention | FAIL | coordinator joins final_text with no error check |
+| Harness Guards | FAIL | test-before-commit rule lives only in CLAUDE.md |
 | ... | ... | ... |
 
 **Overall: PASS / REVIEW NEEDED (N issues)**
