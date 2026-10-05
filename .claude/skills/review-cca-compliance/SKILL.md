@@ -129,16 +129,25 @@ Work through each section. For every check, report one of:
 
 ---
 
-### 8. Agentic Loop (CCA Rule: terminate on stop_reason, not content-type)
+### 8. Agentic Loop (CCA Rule: terminate on stop_reason, handle every stop_reason)
 
-- [ ] Find the main agentic loop (`while True` or equivalent)
-- [ ] Does it terminate based on `stop_reason != "tool_use"` or `stop_reason == "end_turn"`? → **PASS**
-- [ ] Does it check `response.content[0].type == "text"` to decide whether to stop? → **WARN** (fragile)
+- [ ] Find the main agentic loop (`while True`, `for _ in range(max_iterations)`, or equivalent)
+- [ ] Does it branch on `response.stop_reason`, never on content block types? → **PASS**
+- [ ] Does it check `response.content[0].type == "text"` to decide whether to stop? → **FAIL** (content-type checking)
+- [ ] Is every stop_reason handled explicitly, with its own outcome?
+  - `tool_use` → dispatch tools, continue
+  - `end_turn` / `stop_sequence` → finished
+  - `max_tokens` → finished but marked truncated; the text is never returned as a complete answer
+  - `refusal` → routed to escalation or returned as an error, never as a normal finish
+  - `pause_turn` → resend history, continue
+  - unknown value → raise or return a structured error, never "done"
+  → **PASS** if all six are distinguished
+- [ ] Does the loop collapse every non-`tool_use` value into "done" (e.g. `if stop_reason != "tool_use": return ...`, or passing `stop_reason=response.stop_reason` through with no branch for `max_tokens` or `refusal`)? → **FAIL** (a truncated reply or a refusal is shown to the customer as a finished answer)
 - [ ] Does the loop dispatch ALL tool_use blocks before continuing? → **PASS**
 
-**Anti-pattern signal:** `if response.content[0].type == "text": break`, `if "end_turn" in str(response):`
+**Anti-pattern signal:** `if response.content[0].type == "text": break`, `if "end_turn" in str(response):`, `if response.stop_reason != "tool_use": return`, a single `else` branch that treats every remaining value as finished
 
-**Correct pattern signal:** `while response.stop_reason != "end_turn":` or `while True:` with `if stop_reason != "tool_use": break`
+**Correct pattern signal:** `match response.stop_reason:` with a named case per value and `case _: raise UnexpectedStopReasonError`, or an `if/elif` chain that names each value and raises in the final `else`
 
 ---
 
@@ -148,6 +157,7 @@ Work through each section. For every check, report one of:
 - [ ] Do subagents share the coordinator's `messages` list or `system_prompt`? → **FAIL**
 - [ ] Does each subagent have 4-5 focused tools (not the coordinator's full set)? → **PASS**
 - [ ] Do subagents communicate directly with each other? → **FAIL** (must go through coordinator)
+- [ ] Does the coordinator tell a failed subagent from a finished one before synthesis? → checked in Section 12
 
 **Anti-pattern signal:** `subagent_messages = coordinator_messages`, passing `system_prompt=coordinator_system_prompt` to subagents
 
@@ -181,6 +191,23 @@ Work through each section. For every check, report one of:
 
 ---
 
+### 12. Silent Failure Prevention (CCA Rule: structured error context, never swallowed errors)
+
+The structured error shape has six fields: `status`, `error_type`, `source`, `retry_eligible`, `fallback_available`, `partial_data`. Check it at every boundary where a caller must decide what to do next.
+
+- [ ] **Tool boundary.** Does the dispatcher return that shape as JSON for an unknown tool name and for invalid input? → **PASS**. Does it raise, return `None`, or return a bare string? → **FAIL**
+- [ ] **Loop boundary.** Does the agent loop's result carry that shape for every degraded outcome (`max_tokens`, a failed forced escalation, `max_iterations`)? → **PASS**. Is the only signal a `stop_reason` string the caller has to interpret? → **FAIL**
+- [ ] Is `retry_eligible` meaningful (true for truncation and iteration limits, false for a failed escalation that a retry cannot fix)? → **PASS**
+- [ ] Does `partial_data` carry what was recovered (partial text, tool call count, the flag that required escalation)? → **PASS**
+- [ ] **Coordinator boundary.** Does the coordinator branch on each subagent result's error before synthesis, withhold degraded text from the synthesis prompt, and expose which subtasks degraded? → **PASS**. Does it join every subagent's `final_text` regardless of outcome? → **FAIL** (a truncated or empty answer is synthesized into a confident reply)
+- [ ] Is any exception swallowed (`except: pass`, `except Exception: return ""`)? → **FAIL**
+
+**Anti-pattern signal:** `return None` on error, `except: pass`, `"\n\n".join(r.final_text for r in results)` with no check on `r.error` or `r.stop_reason`, `AgentResult` with no error field
+
+**Correct pattern signal:** `"retry_eligible"`, `"partial_data"`, `AgentResult.error`, `CoordinatorResult.degraded`, `if r.error is None:` before synthesis, `_structured_error(...)`
+
+---
+
 ## Output Format
 
 For each check, report findings in this format:
@@ -205,6 +232,8 @@ End with a summary table:
 | Tool Count | PASS | 5 tools |
 | Tool Descriptions | WARN | 2 tools missing negative bounds |
 | Escalation Logic | PASS | deterministic callbacks |
+| Agentic Loop | FAIL | max_tokens and refusal collapsed into "done" |
+| Silent Failure Prevention | FAIL | coordinator joins final_text with no error check |
 | ... | ... | ... |
 
 **Overall: PASS / REVIEW NEEDED (N issues)**
