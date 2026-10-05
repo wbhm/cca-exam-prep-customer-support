@@ -12,6 +12,8 @@ venv/
 
 # Claude Code personal overrides (not auto-ignored; the docs say to add this yourself)
 CLAUDE.local.md
+# IDE-written MCP server config; the port is per-launch and machine-specific
+.mcp.json
 
 # IDE
 .idea/
