@@ -132,7 +132,7 @@ This project doesn't just *teach* CCA patterns -- it *uses* them:
 ### Programmatic Enforcement
 
 - `.pre-commit-config.yaml` -- nbstripout, ruff, and the test suite on every `git commit`, once you run `poetry run pre-commit install` (the config alone enforces nothing)
-- `.claude/settings.json` -- a PreToolUse hook that runs the suite and blocks `git commit` / `git push` from Claude Code when it is red
+- `.claude/settings.json` -- a PreToolUse hook that runs the suite and blocks `git commit` / `git push` from Claude Code when it is red, and a PostToolUse hook that runs ruff on every edited Python file and feeds the findings back (report-only, never rewrites the file)
 - Same principle as callbacks: code enforces rules, not human memory
 
 ## Testing
