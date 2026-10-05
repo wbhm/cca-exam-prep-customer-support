@@ -14,6 +14,7 @@ from collections.abc import Callable
 
 from customer_service.services.container import ServiceContainer
 from customer_service.tools.check_policy import handle_check_policy
+from customer_service.tools.definitions import REDACTED_FIELDS
 from customer_service.tools.escalate_to_human import handle_escalate_to_human
 from customer_service.tools.log_interaction import handle_log_interaction
 from customer_service.tools.lookup_customer import handle_lookup_customer
@@ -50,6 +51,8 @@ def dispatch(
 
     Callback execution:
     - process_refund: two-step vetoable dispatch (propose -> callback -> commit or block)
+    - Tools that persist free text (REDACTED_FIELDS keys): run the callback on the INPUT
+      first so redacted values are what the handler writes to the store
     - Other tools: run handler, then callback. If action="replace_result", return replacement.
 
     Args:
@@ -86,17 +89,21 @@ def dispatch(
                 input_dict, services, ctx, callbacks["process_refund"]
             )
 
-        # Pre-handler callback for log_interaction: redact input BEFORE handler writes
-        # CCA Rule: PII must never reach the audit log — redact before write, not after
-        if tool_name == "log_interaction" and callbacks and "log_interaction" in callbacks:
-            cb = callbacks["log_interaction"]
-            # Pass input_dict as result_dict so callback can find "details" field
+        # Pre-handler callback for tools that persist free text: redact the INPUT
+        # before the handler writes. CCA Rule: PII must never reach the audit log or
+        # the escalation queue — redact before the write, not after.
+        pre_write = tool_name in REDACTED_FIELDS and bool(callbacks) and tool_name in callbacks
+        if pre_write:
+            cb = callbacks[tool_name]
+            # Pass input_dict as result_dict so the callback sees the flat field shape
             cb_result = cb(tool_name, input_dict, input_dict, ctx, services)
             if cb_result.action == "replace_result" and cb_result.replacement is not None:
                 try:
                     redacted = json.loads(cb_result.replacement)
-                    if "details" in redacted:
-                        input_dict = {**input_dict, "details": redacted["details"]}
+                    input_dict = {
+                        **input_dict,
+                        **{k: redacted[k] for k in REDACTED_FIELDS[tool_name] if k in redacted},
+                    }
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -105,7 +112,7 @@ def dispatch(
 
         if callbacks:
             cb = callbacks.get(tool_name)
-            if cb is not None and tool_name != "log_interaction":  # already handled above
+            if cb is not None and not pre_write:  # pre-write tools already handled above
                 try:
                     result_dict = json.loads(result)
                 except (json.JSONDecodeError, ValueError):

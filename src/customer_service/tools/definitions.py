@@ -128,3 +128,19 @@ TOOLS: list[dict] = [
     ESCALATE_TO_HUMAN_TOOL,
     LOG_INTERACTION_TOOL,
 ]
+
+# ---------------------------------------------------------------------------
+# Free-text fields that must be scrubbed before they reach a persistent store.
+# Keyed by tool name. The audit log and the escalation queue are both "tickets"
+# in the policy document's sense: card numbers must never appear in either.
+# A tool not listed here falls back to ALL_REDACTED_FIELDS.
+# ---------------------------------------------------------------------------
+
+REDACTED_FIELDS: dict[str, tuple[str, ...]] = {
+    "log_interaction": ("details",),
+    "escalate_to_human": ("conversation_summary", "escalation_reason", "recommended_action"),
+}
+
+ALL_REDACTED_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(f for fields in REDACTED_FIELDS.values() for f in fields)
+)

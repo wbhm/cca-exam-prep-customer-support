@@ -10,7 +10,9 @@ Escalation thresholds (from CCA rules):
   - legal complaint keywords in user message
 
 Compliance:
-  - PII redaction: credit card numbers redacted to ****-****-****-NNNN pattern
+  - PII redaction: credit card numbers redacted to ****-****-****-NNNN pattern in
+    every free-text field that reaches a persistent store (audit log and
+    escalation queue), before the write happens
 """
 
 import json
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from customer_service.services.container import ServiceContainer
+from customer_service.tools.definitions import ALL_REDACTED_FIELDS, REDACTED_FIELDS
 
 # ---------------------------------------------------------------------------
 # Legal keyword detection (CCA: deterministic rules, not LLM confidence)
@@ -49,6 +52,11 @@ ESCALATION_FLAGS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 CARD_PATTERN: re.Pattern[str] = re.compile(r"\b(\d{4}[-\s]\d{4}[-\s]\d{4}[-\s])(\d{4})\b")
+
+# Nested containers the tool handlers wrap their stored object in:
+#   log_interaction   -> {"status": "logged",    "entry":  {...}}
+#   escalate_to_human -> {"status": "escalated", "record": {...}}
+_NESTED_KEYS: tuple[str, ...] = ("entry", "record")
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +183,21 @@ def escalation_callback(
     return CallbackResult(action="allow")
 
 
+def _redact_fields(data: dict, fields: tuple[str, ...]) -> tuple[dict, int]:
+    """Return a copy of data with card numbers redacted in the named string fields."""
+    redacted = dict(data)
+    total = 0
+    for name in fields:
+        value = data.get(name)
+        if not isinstance(value, str):
+            continue
+        new_value, count = CARD_PATTERN.subn(r"****-****-****-\2", value)
+        if count:
+            redacted[name] = new_value
+            total += count
+    return redacted, total
+
+
 def compliance_callback(
     tool_name: str,
     input_dict: dict,
@@ -182,41 +205,39 @@ def compliance_callback(
     context: dict,
     services: ServiceContainer,
 ) -> CallbackResult:
-    """Enforce PII redaction for log_interaction results.
+    """Enforce PII redaction for every free-text field that reaches a store.
 
     CCA Rule: Programmatic redaction enforces PCI compliance — system prompt instructions
-    alone are unreliable.
+    alone are unreliable. The fields scrubbed per tool are listed in REDACTED_FIELDS.
 
-    Credit card numbers matching NNN[N]-NNN[N]-NNN[N]-NNN[N] pattern are replaced with
-    ****-****-****-NNNN (preserving last 4 digits for reference).
+    Credit card numbers matching NNNN-NNNN-NNNN-NNNN (dash or space separated) are
+    replaced with ****-****-****-NNNN (preserving last 4 digits for reference).
 
     Handles two result shapes:
-    - Flat: {"details": "..."}  (used in unit tests)
-    - Nested: {"status": "logged", "entry": {"details": "..."}}  (log_interaction output)
+    - Flat: the fields sit at the top level of result_dict. This is the shape
+      dispatch() passes BEFORE the handler runs (input_dict as result_dict), so the
+      redacted values can be written to the store instead of the originals.
+    - Nested: {"status": ..., "entry": {...}} or {"status": ..., "record": {...}}
+      (the handlers' output shape). Redacted nested fields are also exposed at the
+      top level for test assertions and audit inspection.
 
     Returns action="replace_result" with redacted JSON if any card numbers found.
     Returns action="allow" if no PII detected.
     """
-    total_count = 0
-    redacted_result = dict(result_dict)
+    fields = REDACTED_FIELDS.get(tool_name, ALL_REDACTED_FIELDS)
 
-    # Handle flat "details" field (unit-test shape)
-    if "details" in result_dict:
-        redacted_details, count = CARD_PATTERN.subn(r"****-****-****-\2", result_dict["details"])
-        if count > 0:
-            redacted_result["details"] = redacted_details
-            total_count += count
+    redacted_result, total_count = _redact_fields(result_dict, fields)
 
-    # Handle nested "entry.details" field (log_interaction handler output shape)
-    entry = result_dict.get("entry")
-    if isinstance(entry, dict) and "details" in entry:
-        redacted_entry_details, count = CARD_PATTERN.subn(r"****-****-****-\2", entry["details"])
-        if count > 0:
-            redacted_entry = dict(entry)
-            redacted_entry["details"] = redacted_entry_details
-            redacted_result["entry"] = redacted_entry
-            # Expose top-level "details" for test assertions and audit inspection
-            redacted_result["details"] = redacted_entry_details
+    for key in _NESTED_KEYS:
+        nested = result_dict.get(key)
+        if not isinstance(nested, dict):
+            continue
+        redacted_nested, count = _redact_fields(nested, fields)
+        if count:
+            redacted_result[key] = redacted_nested
+            for name in fields:
+                if name in nested and redacted_nested[name] != nested[name]:
+                    redacted_result[name] = redacted_nested[name]
             total_count += count
 
     if total_count == 0:
@@ -225,7 +246,7 @@ def compliance_callback(
     return CallbackResult(
         action="replace_result",
         replacement=json.dumps(redacted_result),
-        reason=f"Redacted {total_count} credit card number(s) from log details",
+        reason=f"Redacted {total_count} credit card number(s) from {tool_name} fields",
     )
 
 
@@ -237,8 +258,9 @@ def compliance_callback(
 def build_callbacks() -> dict[str, CallbackFn]:
     """Build and return the per-tool callback registry.
 
-    CCA Rule: Per-tool dispatch — each callback is registered for exactly one tool.
-    Callbacks not registered for a tool are never called for that tool.
+    CCA Rule: Per-tool dispatch — a callback runs only for the tools it is registered
+    under. compliance_callback is registered for every tool that persists free text
+    (see REDACTED_FIELDS); the others are registered for exactly one tool.
 
     Returns:
         Dict mapping tool_name -> callback function.
@@ -248,4 +270,5 @@ def build_callbacks() -> dict[str, CallbackFn]:
         "check_policy": check_policy_callback,
         "process_refund": escalation_callback,
         "log_interaction": compliance_callback,
+        "escalate_to_human": compliance_callback,
     }

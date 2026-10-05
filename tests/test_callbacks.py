@@ -379,6 +379,7 @@ class TestBuildCallbacks:
         assert "check_policy" in callbacks
         assert "process_refund" in callbacks
         assert "log_interaction" in callbacks
+        assert "escalate_to_human" in callbacks
 
     def test_callbacks_are_callable(self, fresh_services):
         callbacks = build_callbacks()
@@ -547,3 +548,44 @@ class TestVetoGuarantee:
         parsed = json.loads(result)
         assert parsed["status"] == "blocked"
         assert fresh_services.financial_system.get_processed() == []
+
+    def test_compliance_escalation_queue_never_has_raw_pii(self, fresh_services):
+        """escalate_to_human with a card number in the summary -> queued record is redacted.
+
+        CCA Rule: PCI redaction is a property of every persistent store, not of one
+        tool. The policy document forbids card numbers in any "log, note, or ticket";
+        the escalation record is the ticket. Tests the store, not the returned JSON.
+        """
+        from customer_service.tools.handlers import dispatch
+
+        callbacks = build_callbacks()
+        context: dict = {"user_message": "I want a refund"}
+
+        dispatch(
+            "escalate_to_human",
+            {
+                "customer_id": "C001",
+                "customer_tier": "vip",
+                "issue_type": "refund",
+                "disputed_amount": 900.0,
+                "escalation_reason": "Customer read out card 4111-1111-1111-1111",
+                "recommended_action": "Refund to card 4111 1111 1111 1111",
+                "conversation_summary": "Customer gave card 4111-1111-1111-1111 for refund",
+                "turns_elapsed": 2,
+            },
+            fresh_services,
+            context=context,
+            callbacks=callbacks,
+        )
+
+        # Check the ACTUAL escalation queue, not the returned JSON
+        records = fresh_services.escalation_queue.get_escalations()
+        assert len(records) == 1
+        record = records[0]
+        for field_name in ("conversation_summary", "escalation_reason", "recommended_action"):
+            value = getattr(record, field_name)
+            assert "4111-1111-1111-1111" not in value and "4111 1111 1111 1111" not in value, (
+                f"Raw PII leaked to escalation queue via {field_name} — "
+                "redaction must happen BEFORE handler write"
+            )
+            assert "****-****-****-1111" in value
