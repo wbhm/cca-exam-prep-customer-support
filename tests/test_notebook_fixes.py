@@ -318,13 +318,13 @@ class TestNB08MetaTeaching:
         assert "/review-cca-compliance src/" in source
 
     def test_skill_check_count_matches_notebook_claim(self) -> None:
-        """The notebook says 11 checks; count numbered headings, not every '###'."""
+        """The notebook says 12 checks; count numbered headings, not every '###'."""
         import re
 
         checks = re.findall(r"^### \d+\. ", SKILL_PATH.read_text(), re.MULTILINE)
-        assert len(checks) == 11
+        assert len(checks) == 12
         source = "\n".join(c.source for c in self._nb().cells if c.cell_type == "markdown")
-        assert "11 focused checks" in source
+        assert "12 focused checks" in source
 
     def test_ci_command_has_audited_flags(self) -> None:
         """The flags must be on the claude command, not only in comments."""
