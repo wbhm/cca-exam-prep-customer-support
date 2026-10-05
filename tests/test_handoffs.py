@@ -845,3 +845,46 @@ class TestTurnEndEscalation:
         assert result.stop_reason == "end_turn"
         assert services.escalation_queue.get_escalations() == []
         assert mock_client.messages.create.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# TestForcedEscalationVerifiesStore
+# ---------------------------------------------------------------------------
+
+
+class TestForcedEscalationVerifiesStore:
+    """The 'escalated' stop_reason is a claim about the store, not about the API call."""
+
+    def test_forced_call_without_tool_use_is_not_reported_as_escalated(self):
+        """Forced call truncated before any tool_use block -> queue empty -> not 'escalated'."""
+        services = _make_services()
+        blocked_refund = _make_response(
+            stop_reason="tool_use",
+            content=[
+                _make_tool_use_block(
+                    "process_refund",
+                    {"customer_id": "C001", "order_id": "O001", "amount": 750.0},
+                    "toolu_01",
+                ),
+            ],
+        )
+        truncated_forced = _make_response(
+            stop_reason="max_tokens",
+            content=[_make_text_block("I will escalate th")],
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [blocked_refund, truncated_forced]
+
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="I need a refund",
+            system_prompt=get_system_prompt(),
+            callbacks={"process_refund": _always_block_refund},
+        )
+
+        # TEST THE STORE: nothing reached the queue, so the result must say so
+        assert services.escalation_queue.get_escalations() == []
+        assert result.stop_reason == "escalation_failed"
+        assert result.stop_reason != "escalated"
+        assert mock_client.messages.create.call_count == 2

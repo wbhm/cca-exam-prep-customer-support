@@ -57,8 +57,9 @@ Customer message
      - lookup_customer / check_policy: callbacks set escalation flags in the loop context
   -> if blocked: structured 'blocked' result with action_required=escalate_to_human
      -> agent_loop.py forces escalate_to_human with tool_choice
-  -> loop continues until stop_reason != 'tool_use'
+  -> loop continues on tool_use (and pause_turn); every other stop_reason is matched explicitly
   -> at turn end: if an escalation flag is set and nothing is queued, force escalation
+  -> on refusal: force escalation; 'escalated' is reported only if the queue grew
 ```
 
 Every layer enforces a CCA principle:
@@ -1108,16 +1109,35 @@ def run_agent_loop(
     tool_calls: list[dict] = []
     usage = UsageSummary()
 
-    def _force_escalation() -> None:
+    def _force_escalation() -> bool:
         # One API call with tool_choice pinned to escalate_to_human; dispatch the result.
+        queued_before = len(services.escalation_queue.get_escalations())
         forced = client.messages.create(
             model=model, max_tokens=max_tokens, system=system_prompt,
             tools=active_tools, messages=messages,
             tool_choice={"type": "tool", "name": "escalate_to_human"},
         )
         _add_usage(usage, forced.usage)
-        messages.append({"role": "assistant", "content": forced.content})
-        ...  # dispatch the tool_use block, append its tool_result as a user turn
+        ...  # record the assistant turn, dispatch its tool_use block, append the tool_result
+        # The store is the truth: a forced call that was refused or truncated queued nothing.
+        return len(services.escalation_queue.get_escalations()) > queued_before
+
+    def _escalate(final_text, notice) -> AgentResult:
+        if notice is not None:
+            messages.append({"role": "user", "content": json.dumps(notice)})
+        queued = _force_escalation()
+        return _result("escalated" if queued else "escalation_failed", final_text)
+
+    def _finish_turn(stop_reason, final_text) -> AgentResult:
+        # TURN-END ENFORCEMENT: Claude stopped (e.g. asked a question) while a
+        # flag is set and nothing is queued. No tool ran, so no callback could
+        # catch this. Checked against the store, not against Claude's text.
+        flag = _pending_escalation_flag(context, services)
+        if flag is None:
+            return _result(stop_reason, final_text)
+        notice = {"status": "escalation_required", "reason": ESCALATION_FLAGS[flag],
+                  "flag_triggered": flag, "action_required": "escalate_to_human"}
+        return _escalate(final_text, notice)
 
     for _iteration in range(max_iterations):
         response = client.messages.create(
@@ -1125,64 +1145,45 @@ def run_agent_loop(
             tools=active_tools, messages=messages,
         )
         _add_usage(usage, response.usage)
-        messages.append({"role": "assistant", "content": response.content})
+        _record_assistant_turn(response.content)
 
-        # CCA RULE: check stop_reason, never content block types
-        if response.stop_reason != "tool_use":
-            final_text = ...  # first text block, if any
+        # CCA RULE: branch on stop_reason, never on content block types.
+        # Every value is named; the default branch is a tripwire, not "done".
+        match response.stop_reason:
+            case "tool_use":
+                tool_results = _dispatch_tool_blocks(response.content)
+                # CCA PITFALL: send ONLY tool_result blocks — no text alongside them
+                messages.append({"role": "user", "content": tool_results})
+                # HANDOFF-01: a blocked refund forces escalation immediately
+                if _has_escalation_required(tool_results):
+                    return _escalate(final_text="", notice=None)
+            case "pause_turn":
+                continue  # a server-side tool paused; resend the history unchanged
+            case "end_turn" | "stop_sequence":
+                return _finish_turn(response.stop_reason, _first_text(response.content))
+            case "max_tokens":
+                # Degraded: the reply was cut off. Same guard; callers see 'max_tokens'.
+                return _finish_turn("max_tokens", _first_text(response.content))
+            case "refusal":
+                # Blocked: a safety classifier declined. No callback will fire,
+                # so hand the case to a human.
+                notice = {"status": "escalation_required", "flag_triggered": "refusal",
+                          "reason": "Model declined to continue (stop_reason: refusal)",
+                          "action_required": "escalate_to_human"}
+                return _escalate(_first_text(response.content), notice)
+            case other:
+                raise UnexpectedStopReasonError(other, _result(other, ""))
 
-            # TURN-END ENFORCEMENT: Claude stopped (e.g. asked a question) while a
-            # flag is set and nothing is queued. No tool ran, so no callback could
-            # catch this. Checked against the store, not against Claude's text.
-            flag = _pending_escalation_flag(context, services)
-            if flag is not None:
-                notice = {
-                    "status": "escalation_required",
-                    "reason": ESCALATION_FLAGS[flag],
-                    "flag_triggered": flag,
-                    "action_required": "escalate_to_human",
-                }
-                messages.append({"role": "user", "content": json.dumps(notice)})
-                _force_escalation()
-                return AgentResult(stop_reason="escalated", messages=messages,
-                                   tool_calls=tool_calls, final_text=final_text, usage=usage)
-
-            return AgentResult(stop_reason=response.stop_reason, messages=messages,
-                               tool_calls=tool_calls, final_text=final_text, usage=usage)
-
-        # Dispatch all tool_use blocks and collect results
-        tool_results = []
-        for block in response.content:
-            if not (hasattr(block, "type") and block.type == "tool_use"):
-                continue
-            tool_calls.append({"name": block.name, "input": block.input, "id": block.id})
-            result_content = dispatch(
-                block.name, block.input, services, context=context, callbacks=callbacks
-            )
-            tool_results.append(
-                {"type": "tool_result", "tool_use_id": block.id, "content": result_content}
-            )
-
-        # CCA PITFALL: send ONLY tool_result blocks — no text alongside them
-        messages.append({"role": "user", "content": tool_results})
-
-        # HANDOFF-01: a blocked refund forces escalation immediately
-        if _has_escalation_required(tool_results):
-            _force_escalation()
-            return AgentResult(stop_reason="escalated", messages=messages,
-                               tool_calls=tool_calls, final_text="", usage=usage)
-
-    return AgentResult(stop_reason="max_iterations", messages=messages,
-                       tool_calls=tool_calls, final_text="", usage=usage)
+    return _result("max_iterations", "")
 ```
 
 Key design decisions:
 
-1. **Stop on `stop_reason != "tool_use"`**: Not `== "end_turn"`. This handles `max_tokens` and other stop reasons gracefully.
+1. **Match every `stop_reason` explicitly**: Not `!= "tool_use"` and not `== "end_turn"`. `end_turn` and `stop_sequence` finish the turn; `max_tokens` finishes too but is passed through so a truncated reply is never presented as complete; `pause_turn` resends the history; `refusal` forces escalation; anything else raises `UnexpectedStopReasonError`. The Messages API has added stop reasons before (`pause_turn`, `refusal`), and a binary check would have filed both under "done".
 
 2. **Tool results are user messages with ONLY `tool_result` blocks**: No text alongside. Mixing text and `tool_result` in the same message is a Claude API pitfall.
 
-3. **Forced escalation, two triggers**: When a tool result says `action_required: "escalate_to_human"`, or when Claude ends its turn with an escalation flag set and the queue empty, the loop makes one more API call with `tool_choice` pinned to the escalation tool. Both paths return `stop_reason="escalated"`. On most live runs neither fires, because Claude escalates on its own after reading the policy result; the guarantee is for the runs where it does not.
+3. **Forced escalation, three triggers, store-verified**: When a tool result says `action_required: "escalate_to_human"`, when Claude ends its turn with an escalation flag set and the queue empty, or when Claude refuses to continue, the loop makes one more API call with `tool_choice` pinned to the escalation tool. The result is `stop_reason="escalated"` only if the escalation queue actually grew; a forced call that was itself refused or truncated returns `escalation_failed`, so the caller knows no human has seen the case. On most live runs none of these fire, because Claude escalates on its own after reading the policy result; the guarantee is for the runs where it does not.
 
 4. **Max iterations**: 10 iterations prevents infinite loops. In practice, most conversations complete in 3-4 iterations.
 

@@ -3,7 +3,15 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from customer_service.agent.agent_loop import AgentResult, UsageSummary, run_agent_loop
+import pytest
+
+from customer_service.agent.agent_loop import (
+    AgentResult,
+    UnexpectedStopReasonError,
+    UsageSummary,
+    run_agent_loop,
+)
+from customer_service.agent.callbacks import build_callbacks
 from customer_service.agent.system_prompts import get_system_prompt
 
 
@@ -189,3 +197,172 @@ class TestSystemPrompt:
     def test_system_prompt_mentions_customer_support(self):
         prompt = get_system_prompt()
         assert "customer" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestStopReasonDispatch
+# ---------------------------------------------------------------------------
+
+
+def _escalation_input(amount=600.0):
+    return {
+        "customer_id": "C003",
+        "customer_tier": "regular",
+        "issue_type": "refund",
+        "disputed_amount": amount,
+        "escalation_reason": "Refund amount exceeds $500 review threshold",
+        "recommended_action": "Review refund request",
+        "conversation_summary": f"Customer requested refund of ${amount}",
+        "turns_elapsed": 1,
+    }
+
+
+def _forced_escalation_response(tool_id="toolu_99"):
+    """What the API returns for a tool_choice-forced escalate_to_human call."""
+    return _make_response(
+        stop_reason="tool_use",
+        content=[_make_tool_use_block("escalate_to_human", _escalation_input(), tool_id)],
+    )
+
+
+def _c003_lookup_and_policy():
+    """Scripted turns that make build_callbacks() set the requires_review flag."""
+    lookup = _make_response(
+        stop_reason="tool_use",
+        content=[_make_tool_use_block("lookup_customer", {"customer_id": "C003"}, "toolu_01")],
+    )
+    policy = _make_response(
+        stop_reason="tool_use",
+        content=[
+            _make_tool_use_block(
+                "check_policy",
+                {"customer_id": "C003", "customer_tier": "regular", "requested_amount": 600.0},
+                "toolu_02",
+            )
+        ],
+    )
+    return [lookup, policy]
+
+
+class TestStopReasonDispatch:
+    """Every stop_reason the Messages API can return is handled explicitly.
+
+    end_turn / stop_sequence -> finished; max_tokens -> finished but degraded;
+    tool_use -> dispatch; pause_turn -> resend; refusal -> forced escalation;
+    anything else -> UnexpectedStopReasonError. Nothing lands in "done" by default.
+    """
+
+    def test_stop_sequence_finishes_like_end_turn(self, services):
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="stop_sequence",
+            content=[_make_text_block("Done at the stop sequence")],
+        )
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "stop_sequence"
+        assert result.final_text == "Done at the stop sequence"
+        assert mock_client.messages.create.call_count == 1
+
+    def test_pause_turn_resends_without_appending_a_user_turn(self, services):
+        """pause_turn means 'call again with the same history', not 'done'."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _make_response(stop_reason="pause_turn", content=[_make_text_block("Searching...")]),
+            _make_response(stop_reason="end_turn", content=[_make_text_block("Resumed")]),
+        ]
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "end_turn"
+        assert result.final_text == "Resumed"
+        assert mock_client.messages.create.call_count == 2
+        second_call_messages = mock_client.messages.create.call_args_list[1][1]["messages"]
+        assert second_call_messages[-1]["role"] == "assistant"
+        assert result.tool_calls == []
+
+    def test_refusal_forces_escalation_into_queue(self, services):
+        """A refusal is a blocked customer: the loop must hand the case to a human."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _make_response(stop_reason="refusal", content=[]),
+            _forced_escalation_response(),
+        ]
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="Customer ID: C003. I need a $600 refund.",
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+        # TEST THE STORE
+        assert len(services.escalation_queue.get_escalations()) == 1
+        assert result.stop_reason == "escalated"
+        assert mock_client.messages.create.call_count == 2
+        forced_kwargs = mock_client.messages.create.call_args_list[1][1]
+        assert forced_kwargs["tool_choice"] == {"type": "tool", "name": "escalate_to_human"}
+        # The forced call was preceded by a structured notice naming the refusal.
+        # (Inspect the recorded history: the mock holds a reference to the live list.)
+        notices = [
+            m["content"]
+            for m in result.messages
+            if m["role"] == "user" and isinstance(m["content"], str)
+        ][1:]  # skip the original user_message
+        assert len(notices) == 1
+        assert '"action_required": "escalate_to_human"' in notices[0]
+        assert "refusal" in notices[0]
+
+    def test_refusal_whose_forced_call_is_also_refused_reports_failure(self, services):
+        """If the forced escalation produces nothing, the result must not claim success."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _make_response(stop_reason="refusal", content=[]),
+            _make_response(stop_reason="refusal", content=[]),
+        ]
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert services.escalation_queue.get_escalations() == []
+        assert result.stop_reason == "escalation_failed"
+        assert mock_client.messages.create.call_count == 2
+
+    def test_max_tokens_with_pending_flag_still_escalates(self, services):
+        """A truncated turn does not release the escalation guarantee."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            *_c003_lookup_and_policy(),
+            _make_response(stop_reason="max_tokens", content=[_make_text_block("Your $6")]),
+            _forced_escalation_response(),
+        ]
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="Customer ID: C003. I need a $600 refund for my damaged order.",
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+        assert len(services.escalation_queue.get_escalations()) == 1
+        assert result.stop_reason == "escalated"
+        assert result.final_text == "Your $6"
+        assert mock_client.messages.create.call_count == 4
+
+    def test_unknown_stop_reason_raises_instead_of_finishing(self, services):
+        """A value this loop was not written for is an error, never a silent 'done'."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="some_future_value",
+            content=[_make_text_block("??")],
+            usage=_make_usage(inp=7, out=3),
+        )
+        with pytest.raises(UnexpectedStopReasonError) as exc_info:
+            run_agent_loop(
+                client=mock_client, services=services, user_message="hi", system_prompt="t"
+            )
+        err = exc_info.value
+        assert err.stop_reason == "some_future_value"
+        assert "some_future_value" in str(err)
+        # The partial run is attached so callers can log it
+        assert err.result.stop_reason == "some_future_value"
+        assert len(err.result.messages) == 2
+        assert err.result.usage.input_tokens == 7
