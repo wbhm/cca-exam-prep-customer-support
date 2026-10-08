@@ -1164,6 +1164,10 @@ def run_agent_loop(
             case "max_tokens":
                 # Degraded: the reply was cut off. Same guard; callers see 'max_tokens'.
                 return _finish_turn("max_tokens", _first_text(response.content))
+            case "model_context_window_exceeded":
+                # Degraded: the conversation filled the context window. Same guard,
+                # but _finish_turn marks it NOT retryable: only compaction can help.
+                return _finish_turn("model_context_window_exceeded", _first_text(response.content))
             case "refusal":
                 # Blocked: a safety classifier declined. No callback will fire,
                 # so hand the case to a human.
@@ -1179,7 +1183,7 @@ def run_agent_loop(
 
 Key design decisions:
 
-1. **Match every `stop_reason` explicitly**: Not `!= "tool_use"` and not `== "end_turn"`. `end_turn` and `stop_sequence` finish the turn; `max_tokens` finishes too but is passed through so a truncated reply is never presented as complete; `pause_turn` resends the history; `refusal` forces escalation; anything else raises `UnexpectedStopReasonError`. The Messages API has added stop reasons before (`pause_turn`, `refusal`), and a binary check would have filed both under "done".
+1. **Match every `stop_reason` explicitly**: Not `!= "tool_use"` and not `== "end_turn"`. `end_turn` and `stop_sequence` finish the turn; `max_tokens` finishes too but is passed through so a truncated reply is never presented as complete; `model_context_window_exceeded` finishes the same way but its structured error says `retry_eligible: False`, because the conversation itself no longer fits and only compacting the history (the context manager's job) can help, where a bigger `max_tokens` would; `pause_turn` resends the history; `refusal` forces escalation; anything else raises `UnexpectedStopReasonError`. The Messages API has added stop reasons before (`pause_turn`, `refusal`, `model_context_window_exceeded`), and a binary check would have filed all of them under "done".
 
 2. **Tool results are user messages with ONLY `tool_result` blocks**: No text alongside. Mixing text and `tool_result` in the same message is a Claude API pitfall.
 

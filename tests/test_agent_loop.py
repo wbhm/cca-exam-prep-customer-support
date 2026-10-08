@@ -347,6 +347,29 @@ class TestStopReasonDispatch:
         assert result.final_text == "Your $6"
         assert mock_client.messages.create.call_count == 4
 
+    def test_context_window_exceeded_with_pending_flag_still_escalates(self, services):
+        """A turn cut off by the context window does not release the escalation guarantee."""
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            *_c003_lookup_and_policy(),
+            _make_response(
+                stop_reason="model_context_window_exceeded",
+                content=[_make_text_block("Your $6")],
+            ),
+            _forced_escalation_response(),
+        ]
+        result = run_agent_loop(
+            client=mock_client,
+            services=services,
+            user_message="Customer ID: C003. I need a $600 refund for my damaged order.",
+            system_prompt=get_system_prompt(),
+            callbacks=build_callbacks(),
+        )
+        assert len(services.escalation_queue.get_escalations()) == 1
+        assert result.stop_reason == "escalated"
+        assert result.final_text == "Your $6"
+        assert mock_client.messages.create.call_count == 4
+
     def test_unknown_stop_reason_raises_instead_of_finishing(self, services):
         """A value this loop was not written for is an error, never a silent 'done'."""
         mock_client = MagicMock()
@@ -420,6 +443,27 @@ class TestStructuredErrorOnDegradedResults:
         assert result.error["retry_eligible"] is True
         assert result.error["fallback_available"] is True
         assert result.error["partial_data"] == {"final_text": "Truncat"}
+
+    def test_context_window_exceeded_result_carries_structured_error(self, services):
+        """Context window full -> NOT retryable as-is (the history must be compacted first)."""
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = _make_response(
+            stop_reason="model_context_window_exceeded", content=[_make_text_block("Truncat")]
+        )
+        result = run_agent_loop(
+            client=mock_client, services=services, user_message="hi", system_prompt="t"
+        )
+        assert result.stop_reason == "model_context_window_exceeded"
+        assert result.final_text == "Truncat"
+        assert result.error is not None
+        assert set(result.error) == STRUCTURED_ERROR_FIELDS
+        assert result.error["status"] == "error"
+        assert result.error["error_type"] == "context_window_exceeded"
+        assert result.error["source"] == "agent_loop"
+        assert result.error["retry_eligible"] is False
+        assert result.error["fallback_available"] is True
+        assert result.error["partial_data"] == {"final_text": "Truncat"}
+        assert mock_client.messages.create.call_count == 1
 
     def test_escalation_failed_result_carries_structured_error(self, services):
         """Forced escalation queued nothing -> not retryable, names the trigger."""

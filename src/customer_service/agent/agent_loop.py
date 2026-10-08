@@ -10,6 +10,10 @@ CCA Rules enforced here:
     end_turn / stop_sequence -> finished (turn-end escalation guard applies)
     max_tokens               -> finished but truncated (same guard; callers see
                                 'max_tokens' so the text is never treated as complete)
+    model_context_window_exceeded
+                             -> finished but truncated because the conversation filled
+                                the model's context window (same guard). Unlike
+                                max_tokens, retrying the same history cannot succeed
     refusal                  -> blocked; force escalate_to_human
     anything else            -> UnexpectedStopReasonError
 - Escalation is enforced at three points: when a callback blocks process_refund,
@@ -53,6 +57,11 @@ class AgentResult:
         'stop_sequence'     -> Claude hit a configured stop sequence; treated as end_turn
         'max_tokens'        -> Claude's reply was cut off by max_tokens. final_text is
                                partial and must not be shown as a complete answer.
+        'model_context_window_exceeded'
+                            -> Claude's reply was cut off because the conversation
+                               filled the model's context window. final_text is partial.
+                               A larger max_tokens does not help; the history must be
+                               compacted (see context_manager) before any retry.
         'escalated'         -> escalate_to_human reached the escalation_queue (store
                                verified), after a blocked process_refund, a turn that
                                ended with an escalation flag set, or a refusal.
@@ -69,6 +78,9 @@ class AgentResult:
     outcomes it is the CCA structured error context (status, error_type, source,
     message, retry_eligible, fallback_available, partial_data):
         'max_tokens'        -> error_type 'truncated', retry_eligible, partial final_text
+        'model_context_window_exceeded'
+                            -> error_type 'context_window_exceeded', NOT retryable as-is
+                               (fallback_available: compact the history), partial final_text
         'escalation_failed' -> error_type 'escalation_failed', NOT retryable, names the
                                flag that required escalation
         'max_iterations'    -> error_type 'max_iterations', retry_eligible, tool call count
@@ -340,6 +352,18 @@ def run_agent_loop(
                     fallback_available=True,
                     partial_data={"final_text": final_text},
                 )
+            elif stop_reason == "model_context_window_exceeded":
+                # Not retryable as-is: the same history will overflow again. The
+                # fallback is to compact it (context_manager) and start a fresh turn.
+                error = _structured_error(
+                    error_type="context_window_exceeded",
+                    message="Reply cut off because the conversation filled the model's "
+                    "context window; final_text is incomplete. Compact the history "
+                    "before retrying",
+                    retry_eligible=False,
+                    fallback_available=True,
+                    partial_data={"final_text": final_text},
+                )
             return _result(stop_reason, final_text, error=error)
         notice = {
             "status": "escalation_required",
@@ -384,6 +408,12 @@ def run_agent_loop(
                 # Degraded: the reply was cut off. The escalation guard still applies;
                 # the passthrough stop_reason tells callers the text is incomplete.
                 return _finish_turn("max_tokens", _first_text(response.content))
+
+            case "model_context_window_exceeded":
+                # Degraded: the conversation filled the context window mid-reply.
+                # Same guard as max_tokens, but _finish_turn marks it NOT retryable:
+                # a larger max_tokens cannot help, only compacting the history can.
+                return _finish_turn("model_context_window_exceeded", _first_text(response.content))
 
             case "refusal":
                 # Blocked: a safety classifier declined to continue. The customer is

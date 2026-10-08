@@ -138,11 +138,12 @@ Work through each section. For every check, report one of:
   - `tool_use` → dispatch tools, continue
   - `end_turn` / `stop_sequence` → finished
   - `max_tokens` → finished but marked truncated; the text is never returned as a complete answer
+  - `model_context_window_exceeded` → finished but marked truncated AND not retryable as-is: the conversation filled the context window, so the history must be compacted before any retry. Folding it into `max_tokens` (retry with a bigger cap) is a **WARN**: the retry cannot succeed
   - `refusal` → routed to escalation or returned as an error, never as a normal finish
   - `pause_turn` → resend history, continue
   - unknown value → raise or return a structured error, never "done"
-  → **PASS** if all six are distinguished
-- [ ] Does the loop collapse every non-`tool_use` value into "done" (e.g. `if stop_reason != "tool_use": return ...`, or passing `stop_reason=response.stop_reason` through with no branch for `max_tokens` or `refusal`)? → **FAIL** (a truncated reply or a refusal is shown to the customer as a finished answer)
+  → **PASS** if all seven are distinguished
+- [ ] Does the loop collapse every non-`tool_use` value into "done" (e.g. `if stop_reason != "tool_use": return ...`, or passing `stop_reason=response.stop_reason` through with no branch for `max_tokens`, `model_context_window_exceeded` or `refusal`)? → **FAIL** (a truncated reply or a refusal is shown to the customer as a finished answer)
 - [ ] Does the loop dispatch ALL tool_use blocks before continuing? → **PASS**
 
 **Anti-pattern signal:** `if response.content[0].type == "text": break`, `if "end_turn" in str(response):`, `if response.stop_reason != "tool_use": return`, a single `else` branch that treats every remaining value as finished
